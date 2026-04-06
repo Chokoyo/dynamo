@@ -1975,7 +1975,11 @@ async fn images(
     let stream = engine
         .generate(request)
         .await
-        .map_err(|e| ErrorMessage::from_anyhow(e, "Failed to generate images"))?;
+        .map_err(|e| {
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate images");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
 
     // Process stream to collect metrics and drop http_queue_guard on first response
     let mut http_queue_guard = Some(http_queue_guard);
@@ -1994,7 +1998,10 @@ async fn images(
         .await
         .map_err(|e| {
             tracing::error!("Failed to fold images stream for {}: {:?}", request_id, e);
-            ErrorMessage::internal_server_error("Failed to fold images stream")
+            let err_response =
+                ErrorMessage::internal_server_error("Failed to fold images stream");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
         })?;
 
     inflight.mark_ok();
@@ -2058,7 +2065,11 @@ async fn videos(
     let stream = engine
         .generate(request)
         .await
-        .map_err(|e| ErrorMessage::from_anyhow(e, "Failed to generate videos"))?;
+        .map_err(|e| {
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate videos");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
 
     // Process stream to collect metrics and drop http_queue_guard on first token
     let mut http_queue_guard = Some(http_queue_guard);
@@ -2077,7 +2088,10 @@ async fn videos(
         .await
         .map_err(|e| {
             tracing::error!("Failed to fold videos stream for {}: {:?}", request_id, e);
-            ErrorMessage::internal_server_error("Failed to fold videos stream")
+            let err_response =
+                ErrorMessage::internal_server_error("Failed to fold videos stream");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
         })?;
 
     inflight.mark_ok();
@@ -2119,7 +2133,11 @@ async fn video_stream(
     let stream = engine
         .generate(request)
         .await
-        .map_err(|e| ErrorMessage::from_anyhow(e, "Failed to start video stream"))?;
+        .map_err(|e| {
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to start video stream");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
 
     // Capture the context to cancel the stream if the client disconnects.
     let ctx = stream.context();
@@ -2202,6 +2220,7 @@ async fn video_stream(
                 }
                 _ = ctx.stopped() => {
                     tracing::trace!("Context stopped; breaking MJPEG stream");
+                    inflight.mark_error(ErrorType::Cancelled);
                     break;
                 }
             }
@@ -2217,7 +2236,11 @@ async fn video_stream(
         .body(Body::from_stream(monitored_stream))
         .map(|r| r.into_response())
         .map_err(|e| {
-            ErrorMessage::internal_server_error(&format!("Failed to build MJPEG response: {e}"))
+            // inflight is already owned by the monitored_stream which handles
+            // mark_ok (stream end) and mark_error (cancellation).
+            ErrorMessage::internal_server_error(&format!(
+                "Failed to build MJPEG response: {e}"
+            ))
         })
 }
 
