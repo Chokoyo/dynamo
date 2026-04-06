@@ -24,7 +24,7 @@ the ``@pytest.mark.profiled_vram_gib`` recommendation.
 
 **IMPORTANT**: The test under profile **MUST** read the appropriate KV cache
 override — either directly (see ``test_mock_gpu_alloc.py``) or via launch
-scripts that call ``build_gpu_mem_args`` (e.g. ``agg.sh``).  If the test
+scripts that call ``build_vllm_gpu_mem_args`` / ``build_sglang_gpu_mem_args`` (e.g. ``agg.sh``).  If the test
 ignores the override, every probe will pass at the same peak and the profiler
 will warn that the binary search is unreliable.
 

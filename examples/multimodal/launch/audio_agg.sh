@@ -93,7 +93,7 @@ python -m dynamo.frontend --http-port 8000 &
 python3 components/processor.py --model $MODEL_NAME --prompt-template "$PROMPT_TEMPLATE" &
 
 # run E/P/D workers
-GPU_MEM_ARGS=$(build_gpu_mem_args vllm)
+GPU_MEM_ARGS=$(build_vllm_gpu_mem_args)
 
 CUDA_VISIBLE_DEVICES=0 python3 components/audio_encode_worker.py --model $MODEL_NAME &
 VLLM_NIXL_SIDE_CHANNEL_PORT=20097 CUDA_VISIBLE_DEVICES=1 python3 components/worker.py --model $MODEL_NAME --worker-type prefill $GPU_MEM_ARGS &

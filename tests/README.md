@@ -509,16 +509,16 @@ The profiler automatically detects the engine type and uses the appropriate bina
 - **vLLM**: bisects `_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES` (bytes) → `--kv-cache-memory-bytes`. Finds the minimum KV cache bytes where the test passes, applies a 2x safety factor. Outputs `profiled_vram_gib` and `requested_vllm_kv_cache_bytes` markers.
 - **SGLang**: bisects `_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS` (token count) → `--max-total-tokens`. Finds the minimum KV cache tokens where the test passes, applies a 2x safety factor, then runs a final probe at the safe token count to measure the actual VRAM. Outputs `profiled_vram_gib` and `requested_sglang_kv_tokens` markers.
 
-**Requirement (vLLM):** The launch script must honor `_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES`. This is handled by `build_gpu_mem_args` in `gpu_utils.sh` (returns `--kv-cache-memory-bytes N`).
+**Requirement (vLLM):** The launch script must honor `_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES`. This is handled by `build_vllm_gpu_mem_args` in `gpu_utils.sh` (returns `--kv-cache-memory-bytes N`).
 
-**Requirement (SGLang):** The launch script must honor `_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS`. This is handled by `build_gpu_mem_args` in `gpu_utils.sh` (returns `--max-total-tokens N`).
+**Requirement (SGLang):** The launch script must honor `_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS`. This is handled by `build_sglang_gpu_mem_args` in `gpu_utils.sh` (returns `--max-total-tokens N`).
 
 ### Engine-specific mapping
 
-Launch scripts call `build_gpu_mem_args` (from `examples/common/gpu_utils.sh`) which checks env var overrides and returns the appropriate CLI flags:
+Launch scripts call engine-specific functions from `examples/common/gpu_utils.sh` which check env var overrides and return the appropriate CLI flags:
 
 ```bash
-GPU_MEM_ARGS=$(build_gpu_mem_args sglang)
+GPU_MEM_ARGS=$(build_sglang_gpu_mem_args)
 python -m dynamo.sglang --model-path "$MODEL" $GPU_MEM_ARGS &
 ```
 

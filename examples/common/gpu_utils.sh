@@ -10,42 +10,40 @@
 #   source "$SCRIPT_DIR/../common/gpu_utils.sh"
 #
 # Functions (all return via stdout):
-#   build_gpu_mem_args <engine> [--workers-per-gpu N]
-#       Returns engine-specific CLI args for GPU memory control based on
-#       environment variable overrides. Empty if no overrides.
 #
-#       vLLM:   _PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES   → --kv-cache-memory-bytes N --gpu-memory-utilization 0.01
+#   build_vllm_gpu_mem_args [--workers-per-gpu N]
+#       vLLM:   _PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES → --kv-cache-memory-bytes N --gpu-memory-utilization 0.01
+#
+#   build_sglang_gpu_mem_args
 #       SGLang: _PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS → --max-total-tokens N
 #
 # Usage:
-#   GPU_MEM_ARGS=$(build_gpu_mem_args sglang)
+#   GPU_MEM_ARGS=$(build_sglang_gpu_mem_args)
 #   python -m dynamo.sglang --model-path "$MODEL" $GPU_MEM_ARGS &
 #
-#   GPU_MEM_ARGS=$(build_gpu_mem_args vllm)
+#   GPU_MEM_ARGS=$(build_vllm_gpu_mem_args)
 #   python -m dynamo.vllm --model "$MODEL" $GPU_MEM_ARGS &
-build_gpu_mem_args() {
-    local engine="${1:?usage: build_gpu_mem_args <engine> [--workers-per-gpu N]}"
-    shift
 
+
+# ---------------------------------------------------------------------------
+# build_vllm_gpu_mem_args [--workers-per-gpu N]
+#   Returns vLLM CLI args for GPU memory control.
+#   Empty if _PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES is not set.
+#
+#   --gpu-memory-utilization 0.01 prevents vLLM's startup check from rejecting
+#   the launch when co-resident tests use >10% of VRAM (vLLM checks free memory
+#   against the fraction *before* applying the byte cap).
+# ---------------------------------------------------------------------------
+build_vllm_gpu_mem_args() {
     local workers_per_gpu=1
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --workers-per-gpu) workers_per_gpu="$2"; shift 2 ;;
-            *) echo "build_gpu_mem_args: unknown option '$1'" >&2; return 1 ;;
+            *) echo "build_vllm_gpu_mem_args: unknown option '$1'" >&2; return 1 ;;
         esac
     done
 
-    # --- SGLang: token-based KV cache cap ---
-    if [[ "$engine" == "sglang" && -n "${_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS:-}" ]]; then
-        echo "--max-total-tokens ${_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS}"
-        return 0
-    fi
-
-    # --- vLLM: byte-based KV cache cap ---
-    # --gpu-memory-utilization 0.01 prevents vLLM's startup check from rejecting
-    # the launch when co-resident tests use >10% of VRAM (vLLM checks free memory
-    # against the fraction *before* applying the byte cap).
-    if [[ "$engine" == "vllm" && -n "${_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES:-}" ]]; then
+    if [[ -n "${_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES:-}" ]]; then
         local kv_bytes="$_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES"
         if [[ "$workers_per_gpu" -gt 1 ]]; then
             kv_bytes=$(awk -v b="$kv_bytes" -v n="$workers_per_gpu" 'BEGIN { printf "%d", b / n }')
@@ -54,9 +52,24 @@ build_gpu_mem_args() {
         return 0
     fi
 
-    # No override — engine uses its default allocation
     echo ""
 }
+
+
+# ---------------------------------------------------------------------------
+# build_sglang_gpu_mem_args
+#   Returns SGLang CLI args for GPU memory control.
+#   Empty if _PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS is not set.
+# ---------------------------------------------------------------------------
+build_sglang_gpu_mem_args() {
+    if [[ -n "${_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS:-}" ]]; then
+        echo "--max-total-tokens ${_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS}"
+        return 0
+    fi
+
+    echo ""
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -77,49 +90,49 @@ _gpu_utils_self_test() {
 
     local result
 
+    # --- build_vllm_gpu_mem_args (direct) ---
+
     echo "=== vLLM: kv bytes override ==="
     result=$(_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES=942054000 \
-        build_gpu_mem_args vllm)
+        build_vllm_gpu_mem_args)
     _assert "kv bytes" "--kv-cache-memory-bytes 942054000 --gpu-memory-utilization 0.01" "$result"
 
     echo ""
     echo "=== vLLM: kv bytes with --workers-per-gpu 2 ==="
     result=$(_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES=942054000 \
-        build_gpu_mem_args vllm --workers-per-gpu 2)
+        build_vllm_gpu_mem_args --workers-per-gpu 2)
     _assert "kv bytes / 2" "--kv-cache-memory-bytes 471027000 --gpu-memory-utilization 0.01" "$result"
 
     echo ""
     echo "=== vLLM: no override = empty ==="
-    result=$(build_gpu_mem_args vllm)
+    result=$(build_vllm_gpu_mem_args)
     _assert "empty (engine default)" "" "$result"
 
     echo ""
     echo "=== vLLM: sglang token env ignored ==="
     result=$(_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS=23824 \
-        build_gpu_mem_args vllm)
+        build_vllm_gpu_mem_args)
     _assert "vllm ignores token cap" "" "$result"
+
+    # --- build_sglang_gpu_mem_args (direct) ---
 
     echo ""
     echo "=== sglang: token cap env ==="
     result=$(_PROFILE_OVERRIDE_SGLANG_MAX_TOTAL_TOKENS=1024 \
-        build_gpu_mem_args sglang)
+        build_sglang_gpu_mem_args)
     _assert "token cap" "--max-total-tokens 1024" "$result"
 
     echo ""
     echo "=== sglang: no override = empty ==="
-    result=$(build_gpu_mem_args sglang)
+    result=$(build_sglang_gpu_mem_args)
     _assert "empty (engine default)" "" "$result"
 
     echo ""
     echo "=== sglang: vllm kv bytes env ignored ==="
     result=$(_PROFILE_OVERRIDE_VLLM_KV_CACHE_BYTES=942054000 \
-        build_gpu_mem_args sglang)
+        build_sglang_gpu_mem_args)
     _assert "sglang ignores kv bytes" "" "$result"
 
-    echo ""
-    echo "=== missing engine ==="
-    (build_gpu_mem_args 2>/dev/null)
-    _assert "missing engine exits non-zero" "1" "$?"
 
     echo ""
     echo "=========================================="
