@@ -52,12 +52,32 @@ pub fn find_tool_call_end_position_json(
 ) -> usize {
     match parser {
         "hermes" | "nemotron_deci" => {
+            let start_token = config.tool_call_start_tokens.first().map(|s| s.as_str());
             if let Some(end_token) = config.tool_call_end_tokens.first() {
-                if let Some(pos) = chunk.find(end_token) {
-                    pos + end_token.len()
-                } else {
-                    chunk.len()
+                let Some(first_end) = chunk.find(end_token.as_str()) else {
+                    return chunk.len();
+                };
+                let mut cursor = first_end + end_token.len();
+
+                // Advance past any additional consecutive start→end blocks
+                // so that parallel tool calls are captured as one jailed region.
+                if let Some(start_tok) = start_token {
+                    loop {
+                        let rest = &chunk[cursor..];
+                        let trimmed = rest.trim_start();
+                        if !trimmed.starts_with(start_tok) {
+                            break;
+                        }
+                        let trim_offset = rest.len() - trimmed.len();
+                        let search_from = cursor + trim_offset + start_tok.len();
+                        if let Some(end_pos) = chunk[search_from..].find(end_token.as_str()) {
+                            cursor = search_from + end_pos + end_token.len();
+                        } else {
+                            break;
+                        }
+                    }
                 }
+                cursor
             } else {
                 chunk.len()
             }

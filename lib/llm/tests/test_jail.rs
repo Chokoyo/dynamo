@@ -2597,19 +2597,13 @@ mod parallel_jail_tests {
     async fn test_parallel_tool_calls_single_chunk_hermes() {
         let jail = JailedStream::builder().tool_call_parser("hermes").build();
 
-        // Two parallel calls arrive in one streaming chunk.
+        // Two parallel calls arrive in one streaming chunk (hermes uses JSON inside tags).
         let input_chunks = vec![test_utils::create_mock_response_chunk(
             "<tool_call>\n\
-<function=get_current_weather>\n\
-<parameter=city>Dallas</parameter>\n\
-<parameter=state>TX</parameter>\n\
-</function>\n\
+{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Dallas\", \"state\": \"TX\"}}\n\
 </tool_call>\n\
 <tool_call>\n\
-<function=get_current_weather>\n\
-<parameter=city>Orlando</parameter>\n\
-<parameter=state>FL</parameter>\n\
-</function>\n\
+{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Orlando\", \"state\": \"FL\"}}\n\
 </tool_call>"
                 .to_string(),
             0,
