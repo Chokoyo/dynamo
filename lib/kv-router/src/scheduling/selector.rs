@@ -145,7 +145,14 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
         let get_score = |worker: WorkerWithDpRank| -> f64 {
             let overlap = *overlaps.get(&worker).unwrap_or(&0);
-            let prefill_token = *prefill_tokens.get(&worker).unwrap_or(&isl);
+            // When track_prefill_tokens is false (e.g. decode workers in disaggregated mode),
+            // registered workers have prefill_token=0 in the map because active_tokens is not
+            // accumulated.  Unregistered workers should get the same neutral default (0) so they
+            // are not unfairly penalised relative to registered idle decode workers.
+            // When track_prefill_tokens is true (standard path), fall back to isl so that
+            // unregistered workers are estimated at full request cost, matching registered ones.
+            let default_prefill_token = if request.track_prefill_tokens { isl } else { 0 };
+            let prefill_token = *prefill_tokens.get(&worker).unwrap_or(&default_prefill_token);
             let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
             let decode_block = *decode_blocks
                 .get(&worker)
