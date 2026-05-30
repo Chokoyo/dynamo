@@ -46,6 +46,86 @@ CACHE_SIZE_MAXIMUM = 8
 ENABLE_ENCODER_CACHE = int(os.getenv("ENABLE_ENCODER_CACHE", 1))
 
 
+# ---------------------------------------------------------------------------
+# exp-4 R6 -- encode-worker Prometheus instrumentation.
+#
+# Why this lives here: the autoscaler-side ``EncoderPlanner`` (mode=encode)
+# reads ``encode_in_flight`` per planner tick to decide whether to drop
+# encoder replicas. PLAN.md section 6.1 row 7 and RESULTS.md R5.7 step 1
+# called out that this metric did not exist on the worker side. R6 lands it.
+#
+# Naming follows ``lib/runtime/src/metrics/prometheus_names.rs::name_prefix``
+# (``dynamo_component_*``). Auto-label injection (dynamo_namespace,
+# dynamo_component, dynamo_endpoint, worker_id, model) is handled by the
+# runtime's metrics callback so we do not add labels here.
+# ---------------------------------------------------------------------------
+
+
+def _build_encode_metrics():
+    """Lazily build the encode-worker Prometheus metrics on the global REGISTRY.
+
+    Returns (gauge_in_flight, counter_requests_total, histogram_latency).
+    Returns (None, None, None) if prometheus_client is unavailable or a
+    duplicate registration is detected (which can happen if this module
+    is reimported in tests / smoke-test contexts).
+
+    Lazy import is required because ``prometheus_client`` must not be
+    imported before ``set_prometheus_multiproc_dir()`` in the vLLM
+    runtime (see ``components/src/dynamo/common/utils/prometheus.py``).
+    """
+    try:
+        from prometheus_client import Counter, Gauge, Histogram
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"[encode metrics] prometheus_client unavailable: {e}")
+        return (None, None, None)
+
+    try:
+        g = Gauge(
+            "dynamo_component_encode_requests_in_flight",
+            "Number of encode requests currently being processed by the encode worker (R6 / exp-4 autoscaler input)",
+        )
+        c = Counter(
+            "dynamo_component_encode_requests_total",
+            "Total encode requests handled by this encode worker, by outcome",
+            ["outcome"],
+        )
+        h = Histogram(
+            "dynamo_component_encode_latency_seconds",
+            "Per-request encode latency (from generate() entry to yield) in seconds",
+            buckets=(0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8),
+        )
+        return (g, c, h)
+    except ValueError as e:
+        # Already registered (e.g. on re-import). Fetch the existing
+        # collectors via REGISTRY iteration; if that fails, fall back to
+        # the disabled triple so the handler degrades gracefully.
+        logger.info(f"[encode metrics] re-registration race ({e}); attempting REGISTRY lookup")
+        try:
+            from prometheus_client import REGISTRY  # type: ignore
+
+            existing = {c._name: c for c in REGISTRY._collector_to_names.keys()}  # type: ignore[attr-defined]
+            g = existing.get("dynamo_component_encode_requests_in_flight")
+            c2 = existing.get("dynamo_component_encode_requests_total")
+            h = existing.get("dynamo_component_encode_latency_seconds")
+            return (g, c2, h)
+        except Exception:
+            return (None, None, None)
+
+
+_ENC_IN_FLIGHT_GAUGE = None
+_ENC_TOTAL_COUNTER = None
+_ENC_LATENCY_HIST = None
+
+
+def _ensure_encode_metrics():
+    global _ENC_IN_FLIGHT_GAUGE, _ENC_TOTAL_COUNTER, _ENC_LATENCY_HIST
+    if _ENC_IN_FLIGHT_GAUGE is None:
+        _ENC_IN_FLIGHT_GAUGE, _ENC_TOTAL_COUNTER, _ENC_LATENCY_HIST = _build_encode_metrics()
+    return _ENC_IN_FLIGHT_GAUGE, _ENC_TOTAL_COUNTER, _ENC_LATENCY_HIST
+
+
+
+
 @dataclass
 class EmbeddingItem:
     key: str
@@ -141,6 +221,18 @@ class EncodeWorkerHandler:
         assert (
             request.multimodal_inputs is not None
         ), "multimodal_inputs must not be None for encode worker"
+
+        # exp-4 R6: encode-worker observability. ``encode_in_flight`` is the
+        # input the EncoderPlanner consumes per planner tick (mode=encode).
+        # Counter + histogram are bonuses for upstream dashboards.
+        _enc_g, _enc_c, _enc_h = _ensure_encode_metrics()
+        _enc_started = time.perf_counter()
+        _enc_outcome = "error"
+        if _enc_g is not None:
+            try:
+                _enc_g.inc()
+            except Exception as _e:  # pragma: no cover
+                logger.debug(f"[encode metrics] inc failed: {_e}")
 
         # The following steps encode the requested image and provided useful embeddings.
         # 1. Open the image from the provided URL.
@@ -340,9 +432,27 @@ class EncodeWorkerHandler:
                 f"Average encoding time: {self._accumulated_time / self._processed_requests:.4f} seconds over {self._processed_requests} requests."
             )
 
+            _enc_outcome = "ok"
             # Yield transformed request back
             yield request.model_dump_json()
 
         except Exception as e:
             logger.error(f"Error processing request {request_id}: {e}")
             raise
+        finally:
+            # exp-4 R6: drain the in-flight gauge + record latency/outcome.
+            if _enc_g is not None:
+                try:
+                    _enc_g.dec()
+                except Exception as _e:  # pragma: no cover
+                    logger.debug(f"[encode metrics] dec failed: {_e}")
+            if _enc_h is not None:
+                try:
+                    _enc_h.observe(time.perf_counter() - _enc_started)
+                except Exception as _e:  # pragma: no cover
+                    logger.debug(f"[encode metrics] observe failed: {_e}")
+            if _enc_c is not None:
+                try:
+                    _enc_c.labels(outcome=_enc_outcome).inc()
+                except Exception as _e:  # pragma: no cover
+                    logger.debug(f"[encode metrics] count failed: {_e}")

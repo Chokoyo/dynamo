@@ -95,10 +95,25 @@ class VirtualConnector(PlannerConnector):
         self._prefill_mdc_sub: Optional["FpmEventSubscriber"] = None
         self._decode_mdc_sub: Optional["FpmEventSubscriber"] = None
 
+        # exp-4 R6: Python-side encoder replica tracking. The Rust
+        # binding does not yet take num_encode (only num_prefill /
+        # num_decode). We mirror the routing here so the planner can
+        # emit ENCODER targets and downstream consumers (deployment
+        # orchestrators / smoke tests) can read the desired count.
+        self._desired_num_encode: Optional[int] = None
+        # Optional callback the deployment glue can register to
+        # actually act on the encode-replica decision. Signature:
+        #   async def on_encode_replica_decision(new: int, prev: Optional[int]) -> None
+        # If None the decision is recorded + logged only.
+        self._encode_decision_callback = None
+        # Optional subscriber for encoder MDC entries (mirrors prefill / decode).
+        self._encode_mdc_sub: Optional["FpmEventSubscriber"] = None
+
     def set_mdc_subscribers(
         self,
         prefill: Optional["FpmEventSubscriber"] = None,
         decode: Optional["FpmEventSubscriber"] = None,
+        encode: Optional["FpmEventSubscriber"] = None,
     ) -> None:
         """Inject FPM subscribers used as the MDC source for get_worker_info.
 
@@ -108,6 +123,7 @@ class VirtualConnector(PlannerConnector):
         """
         self._prefill_mdc_sub = prefill
         self._decode_mdc_sub = decode
+        self._encode_mdc_sub = encode
 
     def get_worker_info(
         self,
@@ -119,11 +135,14 @@ class VirtualConnector(PlannerConnector):
         Called by ``resolve_worker_info`` (once, at init) and by the tick-loop
         refresh (once cards are available in discovery).
         """
-        subscriber = (
-            self._prefill_mdc_sub
-            if sub_component_type == SubComponentType.PREFILL
-            else self._decode_mdc_sub
-        )
+        if sub_component_type == SubComponentType.PREFILL:
+            subscriber = self._prefill_mdc_sub
+        elif sub_component_type == SubComponentType.ENCODER:
+            # exp-4 R6: encoder MDC source. Defaults to None until
+            # the deployment glue calls set_mdc_subscribers(encode=).
+            subscriber = self._encode_mdc_sub
+        else:
+            subscriber = self._decode_mdc_sub
         entries = _mdc_entries_from_subscriber(subscriber)
         entry = select_entry(entries, sub_component_type)
         if entry is not None:
@@ -150,6 +169,54 @@ class VirtualConnector(PlannerConnector):
         """Update scaling decision"""
         await self.connector.update_scaling_decision(num_prefill, num_decode)
 
+    async def _update_encode_decision(self, num_encode: int) -> None:
+        """exp-4 R6: record + fan out an encoder-replica decision.
+
+        Mirrors the prefill / decode path but lives entirely in Python
+        because the Rust ``update_scaling_decision`` signature does not
+        yet take ``num_encode``. If a deployment-level callback was
+        registered via :py:meth:`set_encode_decision_callback`, it is
+        invoked with ``(new, prev)``. The latest decision is stored on
+        ``self._desired_num_encode`` and exposed via
+        :py:meth:`get_desired_encode_replicas` so observers can poll.
+        """
+        prev = self._desired_num_encode
+        if prev == num_encode:
+            logger.debug(
+                f"[VirtualConnector] encode replicas already at {num_encode}, no-op"
+            )
+            return
+        logger.info(
+            f"[VirtualConnector] encode replica decision: {prev} -> {num_encode}"
+        )
+        self._desired_num_encode = num_encode
+        cb = self._encode_decision_callback
+        if cb is None:
+            return
+        try:
+            res = cb(num_encode, prev)
+            # Support both sync and async callbacks.
+            if res is not None and hasattr(res, "__await__"):
+                await res
+        except Exception as e:
+            logger.warning(
+                f"[VirtualConnector] encode_decision_callback raised: {e}"
+            )
+
+    def set_encode_decision_callback(self, cb) -> None:
+        """Register a callback fired whenever the encoder replica target changes.
+
+        Signature: ``cb(new: int, prev: Optional[int]) -> None | Awaitable[None]``.
+        Used by deployment substrates (smoke harness, K8s glue) that
+        want to actually act on the encoder decision until the Rust
+        binding learns about ``num_encode``.
+        """
+        self._encode_decision_callback = cb
+
+    def get_desired_encode_replicas(self) -> Optional[int]:
+        """Read the latest encoder replica target (None if never set)."""
+        return self._desired_num_encode
+
     async def _wait_for_scaling_completion(self):
         """Wait for the deployment environment to report that scaling is complete"""
         await self.connector.wait_for_scaling_completion()
@@ -166,6 +233,10 @@ class VirtualConnector(PlannerConnector):
             )
         elif sub_component_type == SubComponentType.DECODE:
             await self._update_scaling_decision(num_decode=state.num_decode_workers + 1)
+        elif sub_component_type == SubComponentType.ENCODER:
+            # exp-4 R6: encoder replicas tracked Python-side.
+            current = self._desired_num_encode if self._desired_num_encode is not None else 0
+            await self._update_encode_decision(current + 1)
 
         if blocking:
             await self._wait_for_scaling_completion()
@@ -182,6 +253,10 @@ class VirtualConnector(PlannerConnector):
         elif sub_component_type == SubComponentType.DECODE:
             new_count = max(0, state.num_decode_workers - 1)
             await self._update_scaling_decision(num_decode=new_count)
+        elif sub_component_type == SubComponentType.ENCODER:
+            current = self._desired_num_encode if self._desired_num_encode is not None else 0
+            new_count = max(0, current - 1)
+            await self._update_encode_decision(new_count)
 
         if blocking:
             await self._wait_for_scaling_completion()
@@ -195,20 +270,32 @@ class VirtualConnector(PlannerConnector):
 
         num_prefill = None
         num_decode = None
+        num_encode = None  # exp-4 R6
 
         for target_replica in target_replicas:
             if target_replica.sub_component_type == SubComponentType.PREFILL:
                 num_prefill = target_replica.desired_replicas
             elif target_replica.sub_component_type == SubComponentType.DECODE:
                 num_decode = target_replica.desired_replicas
+            elif target_replica.sub_component_type == SubComponentType.ENCODER:
+                # exp-4 R6: encoder targets are tracked Python-side
+                # because the Rust binding's update_scaling_decision
+                # signature is (num_prefill, num_decode) only.
+                num_encode = target_replica.desired_replicas
 
-        if num_prefill is None and num_decode is None:
+        if num_prefill is None and num_decode is None and num_encode is None:
             return
 
-        # Update scaling decision if there are any changes
-        await self._update_scaling_decision(
-            num_prefill=num_prefill, num_decode=num_decode
-        )
+        # Update prefill/decode through the Rust coordinator, encoder
+        # through the Python-side tracker. Both calls are awaited in
+        # parallel-friendly sequence (the Rust call is fire-and-forget
+        # for the encoder side).
+        if num_prefill is not None or num_decode is not None:
+            await self._update_scaling_decision(
+                num_prefill=num_prefill, num_decode=num_decode
+            )
+        if num_encode is not None:
+            await self._update_encode_decision(num_encode)
 
         if blocking:
             await self._wait_for_scaling_completion()
