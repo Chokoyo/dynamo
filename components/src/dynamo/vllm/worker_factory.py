@@ -180,6 +180,26 @@ class WorkerFactory:
             config.engine_args, config.embedding_transfer_mode  # type: ignore[arg-type]
         )
         await handler.async_init(runtime)
+
+        # Round-3 (exp-3): the scheduler-authoritative connector lives in
+        # *this* worker's vLLM EngineCore subprocess whenever capacity_gb > 0
+        # AND route_to_encoder is False (see main.py ec_both gate). Register a
+        # Prometheus scrape callback that reads the connector's JSON snapshot.
+        if (
+            not getattr(config, "route_to_encoder", False)
+            and getattr(config, "multimodal_embedding_cache_capacity_gb", 0) > 0
+        ):
+            from .multimodal_utils.multimodal_embedding_cache_connector import (
+                resolve_ec_connector_stats_path,
+            )
+
+            register_ec_connector_metrics(
+                endpoint=generate_endpoint,
+                stats_path=resolve_ec_connector_stats_path(),
+                model_name=config.served_model_name or config.model,
+                component_name=config.component,
+            )
+
         logger.info("Starting to serve the encode worker endpoint...")
 
         try:
