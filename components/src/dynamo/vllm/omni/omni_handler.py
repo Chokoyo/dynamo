@@ -13,6 +13,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 from dynamo._core import Context
 from dynamo.common.multimodal import ImageLoader
+from dynamo.common.multimodal.audio_loader import AudioLoader
 from dynamo.common.protocols.audio_protocol import NvCreateAudioSpeechRequest
 from dynamo.common.protocols.image_protocol import ImageNvExt, NvCreateImageRequest
 from dynamo.common.protocols.video_protocol import NvCreateVideoRequest, VideoNvExt
@@ -95,6 +96,12 @@ class OmniHandler(BaseOmniHandler):
         self.media_output_fs = media_output_fs
         self.media_output_http_url = media_output_http_url
         self._image_loader = ImageLoader()
+        # Audio URL → (waveform, sample_rate) materialization for audio-IN
+        # chat completions (e.g. Qwen2.5-Omni-7B). Mirrors the non-omni
+        # `dynamo.vllm.handlers.VllmHandler.audio_loader` so the AsyncOmni
+        # engine receives `multi_modal_data={"audio": (np.ndarray, sr)}`
+        # which is the modality key its input processor expects.
+        self._audio_loader = AudioLoader()
 
         self.output_formatter = OutputFormatter(
             model_name=config.served_model_name or config.model,
@@ -238,7 +245,7 @@ class OmniHandler(BaseOmniHandler):
         """
         if request_type == RequestType.CHAT_COMPLETION:
             assert isinstance(parsed_request, dict)
-            return self._engine_inputs_from_chat(parsed_request)
+            return await self._engine_inputs_from_chat(parsed_request)
         elif request_type == RequestType.IMAGE_GENERATION:
             assert isinstance(parsed_request, NvCreateImageRequest)
             return self._engine_inputs_from_image(parsed_request)
@@ -251,7 +258,46 @@ class OmniHandler(BaseOmniHandler):
 
         raise ValueError(f"Unknown request type: {request_type}")
 
-    def _engine_inputs_from_chat(self, request: Dict[str, Any]) -> EngineInputs:
+    @staticmethod
+    def _format_prompt_with_audio_placeholders(
+        text: str, n_audio: int, model_name: str
+    ) -> str:
+        """Inject model-arch-specific audio placeholder tokens into the prompt.
+
+        Qwen2.5-Omni's in-engine ``Qwen2_5OmniProcessor`` walks the rendered
+        prompt looking for ``<|audio_bos|><|AUDIO|><|audio_eos|>`` segments
+        (one per ``mm_items["audio"][i]``) and replaces each with that
+        waveform's feature tokens. Without these placeholders, the processor
+        fails with ``Failed to apply prompt replacement for mm_items['audio'][0]``.
+
+        This mirrors the model's published chat template (chat_template.json)
+        which emits one ``<|audio_bos|><|AUDIO|><|audio_eos|>`` per audio
+        content part, wrapped by the standard Qwen ChatML ``<|im_start|>``
+        ``user``/``assistant`` scaffolding.
+
+        Other model families are returned unchanged (no-op fallback).
+        """
+        if n_audio <= 0:
+            return text
+        mn = (model_name or "").lower()
+        is_qwen25_omni = (
+            "qwen2.5-omni" in mn
+            or "qwen2_5_omni" in mn
+            or "qwen2_5omni" in mn
+        )
+        if not is_qwen25_omni:
+            return text
+        audio_block = "<|audio_bos|><|AUDIO|><|audio_eos|>" * n_audio
+        return (
+            "<|im_start|>system\n"
+            "You are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{audio_block}{text}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+    async def _engine_inputs_from_chat(
+        self, request: Dict[str, Any]
+    ) -> EngineInputs:
         """Build engine inputs from a chat completions request dict."""
 
         text_prompt = self._extract_text_prompt(request)
@@ -278,29 +324,55 @@ class OmniHandler(BaseOmniHandler):
                     setattr(sp, arg, value)
             sampling_params_list = self._build_sampling_params_list(sp)
         else:
-            prompt = OmniTextPrompt(prompt=text_prompt)
             audio_urls = self._extract_audio_urls(request)
+            # Inject model-arch-specific audio placeholder tokens before
+            # constructing OmniTextPrompt. For Qwen2.5-Omni-Thinker this
+            # adds one ``<|audio_bos|><|AUDIO|><|audio_eos|>`` per audio
+            # item plus the standard ChatML scaffolding; without these
+            # tokens the in-engine ``Qwen2_5OmniProcessor`` fails with
+            # ``Failed to apply prompt replacement for mm_items['audio'][0]``.
+            formatted_prompt = self._format_prompt_with_audio_placeholders(
+                text_prompt, len(audio_urls), self.config.model
+            )
+            prompt = OmniTextPrompt(prompt=formatted_prompt)
             if audio_urls:
-                # Pass raw URLs through using Dynamo's canonical
-                # ``audio_url`` multi-modal shape (matches
-                # ``dynamo.frontend.utils.extract_mm_urls`` output). The
-                # frontend's AudioLoader resolves these into
-                # ``(waveform, sample_rate)`` tuples before the engine sees
-                # them; here we are intentionally URL-shaped so the existing
-                # decode path remains the single source of truth.
+                # Resolve audio URLs to ``(waveform, sample_rate)`` tuples
+                # before handing to the AsyncOmni engine. The engine's
+                # input processor recognizes the ``"audio"`` modality key
+                # (not ``"audio_url"``), matching what
+                # ``dynamo.vllm.handlers.VllmHandler`` produces for the
+                # non-omni vLLM backend (see ``handlers.py`` line ~1780).
                 # NOTE: if upstream multi_modal_data was already attached to
                 # the request (e.g. a pre-decoded audio_url payload from
                 # frontend NIXL), we merge rather than overwrite.
-                mmd: dict = dict(request.get("multi_modal_data") or {})
-                mmd.setdefault("audio_url", [])
-                mmd["audio_url"] = list(mmd["audio_url"]) + [
-                    {"Url": url} for url in audio_urls
-                ]
-                prompt["multi_modal_data"] = mmd
-                logger.info(
-                    "omni audio-in: attached %d audio_url part(s) to chat prompt",
-                    len(audio_urls),
+                audio_items = [{"Url": url} for url in audio_urls]
+                audios = await self._audio_loader.load_audio_batch(
+                    audio_items
                 )
+                if audios:
+                    mmd: dict = dict(request.get("multi_modal_data") or {})
+                    existing = mmd.get("audio")
+                    new_audio = audios[0] if len(audios) == 1 else audios
+                    if existing is None:
+                        mmd["audio"] = new_audio
+                    else:
+                        # Merge with any pre-attached audio in the request.
+                        existing_list = (
+                            list(existing)
+                            if isinstance(existing, list)
+                            else [existing]
+                        )
+                        new_list = (
+                            list(new_audio)
+                            if isinstance(new_audio, list)
+                            else [new_audio]
+                        )
+                        mmd["audio"] = existing_list + new_list
+                    prompt["multi_modal_data"] = mmd
+                    logger.info(
+                        "omni audio-in: attached %d audio waveform(s) to chat prompt",
+                        len(audios),
+                    )
             sampling_params_list = None
 
         return EngineInputs(
