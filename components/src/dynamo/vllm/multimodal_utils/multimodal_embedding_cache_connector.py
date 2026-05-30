@@ -129,6 +129,11 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
             "misses": 0,
             "evictions": 0,
             "lookups": 0,
+            # Per-kind monotonic event counters. Tracked next to the cache
+            # stats so they survive a scrape race (the events list itself is
+            # drained on every flush). The Prometheus side reports deltas.
+            "events_save": 0,
+            "events_evict": 0,
         }
         self._stats_path = resolve_ec_connector_stats_path()
         self._capacity_gb = capacity_gb
@@ -189,6 +194,11 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
             "engine_id": self._engine_id,
             "ts": time.time(),
         }
+        with self._stats_lock:
+            # Monotonic per-kind counter (race-free for delta computation).
+            key = f"events_{kind}"
+            if key in self._stats:
+                self._stats[key] += 1
         if len(self._event_buf) < self._event_buf_max:
             self._event_buf.append(ev)
 

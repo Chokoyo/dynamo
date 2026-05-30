@@ -606,8 +606,10 @@ def register_ec_connector_metrics(
     events_c.labels(**label_values, event_kind="evict")
 
     lock = threading.Lock()
-    prev = {"hits": 0, "misses": 0, "evictions": 0}
-    event_counts = {"save": 0, "evict": 0}
+    prev = {
+        "hits": 0, "misses": 0, "evictions": 0,
+        "events_save": 0, "events_evict": 0,
+    }
 
     def _read_snapshot() -> Optional[dict]:
         try:
@@ -638,13 +640,19 @@ def register_ec_connector_metrics(
                         counter.labels(**label_values).inc(delta)
                     prev[key] = cur
 
-                # Per-event counters (patch 2 substrate). The connector writes a
-                # rolling buffer of events; count them as they are seen.
-                for ev in snap.get("events", []):
-                    kind = ev.get("kind")
-                    if kind in event_counts:
-                        events_c.labels(**label_values, event_kind=kind).inc()
-                        event_counts[kind] += 1
+                # Patch-2: per-kind event counter deltas (monotonic source
+                # tracked on the connector side, race-free).
+                for stat_key, ev_kind in (
+                    ("events_save", "save"),
+                    ("events_evict", "evict"),
+                ):
+                    cur = int(stats.get(stat_key, 0))
+                    delta = cur - prev[stat_key]
+                    if delta > 0:
+                        events_c.labels(
+                            **label_values, event_kind=ev_kind
+                        ).inc(delta)
+                    prev[stat_key] = cur
 
                 util_g.labels(**label_values).set(float(gauges.get("utilization", 0.0)))
                 bytes_g.labels(**label_values).set(int(gauges.get("current_bytes", 0)))
