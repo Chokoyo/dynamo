@@ -96,6 +96,67 @@ class DecodePlanner(NativePlannerBase):
         )
 
 
+class EncoderPlanner(NativePlannerBase):
+    """Encoder-pool scale-DOWN planner (exp-4).
+
+    Sibling of ``PrefillPlanner`` / ``DecodePlanner``. Drives the
+    ``_advance_load_encoder`` branch added in ``LoadScalingMixin``: the
+    state machine accumulates ``encode_in_flight == 0`` ticks and emits a
+    ``num_encode = N-1`` decision after K consecutive idle ticks.
+
+    Defensive behavior:
+      - require_prefill / require_decode = False: the planner only manages
+        the encoder pool; if the deployment has no encode sub-component,
+        the state machine's "no encoder workers" guard turns this into a
+        no-op (PlannerEffects.scale_to stays None each tick).
+      - _bootstrap_regression is a no-op: there is no FPM-based regression
+        for the encoder (R4 used 5-s nvidia-smi as a proxy; the per-tick
+        gauge is ``encode_in_flight`` from the encoder worker handler,
+        which is consumed by the state machine, not the regression).
+      - _apply_effects emits a single TargetReplica only when the state
+        machine produced ``num_encode``; otherwise it returns silently so
+        the connector layer never sees an empty target list.
+
+    Scale-UP is intentionally absent. R2/R3 confirmed the encoder absorbs
+    the burst at <5 % util on both Qwen2.5-VL-3B and LLaVA-1.5-7B on GB200,
+    so the value proposition on this hardware is reclaim-only. See
+    RESULTS.md §R4.5 for the opportunity sizing (≈100 % reclaim during
+    text-only phases on the R4 text-heavy trace).
+    """
+
+    require_prefill = False
+    require_decode = False
+
+    async def _bootstrap_regression(self) -> None:
+        # The encoder controller is gauge-driven, not regression-driven.
+        # No-op: PrefillPlanner / DecodePlanner load FPM regressors; the
+        # encoder branch only needs the live ``encode_in_flight`` gauge.
+        logger.info("EncoderPlanner: no regression bootstrap required")
+
+    async def _apply_effects(self, effects: PlannerEffects) -> None:
+        if effects.scale_to is None or effects.scale_to.num_encode is None:
+            return
+        desired = effects.scale_to.num_encode
+        # Defensive: only attempt to route the target through the connector
+        # if the deployment actually exposes an encode worker info entry.
+        # Connectors that don't know about SubComponentType.ENCODER will
+        # simply ignore the target (see VirtualConnector.set_component_replicas
+        # which filters by enum membership).
+        encode_worker_info = getattr(self, "encode_worker_info", None)
+        component_name = (
+            encode_worker_info.k8s_name if encode_worker_info is not None else None
+        )
+        await self._apply_scaling_targets(
+            [
+                TargetReplica(
+                    sub_component_type=SubComponentType.ENCODER,
+                    component_name=component_name,
+                    desired_replicas=desired,
+                )
+            ]
+        )
+
+
 class AggPlanner(NativePlannerBase):
     """Aggregated mode (single engine type handles both prefill and decode)."""
 

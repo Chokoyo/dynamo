@@ -59,6 +59,15 @@ class WorkerCounts:
     ready_num_decode: Optional[int] = None
     expected_num_prefill: Optional[int] = None
     expected_num_decode: Optional[int] = None
+    # exp-4 (encoder autoscaler): encoder pool inventory. ``None`` for
+    # non-multimodal deployments; ``_advance_load_encoder`` no-ops when
+    # ``ready_num_encode is None``.
+    ready_num_encode: Optional[int] = None
+    expected_num_encode: Optional[int] = None
+    # Live encoder occupancy gauge sourced from the encode-worker handler's
+    # ``encode_in_flight`` Prometheus metric (PR #10136). The scale-DOWN
+    # controller reclaims a replica when this is 0 for K consecutive ticks.
+    encode_in_flight: Optional[int] = None
 
 
 @dataclass
@@ -91,6 +100,9 @@ class ScalingDecision:
 
     num_prefill: Optional[int] = None
     num_decode: Optional[int] = None
+    # exp-4 (encoder autoscaler): desired encoder replicas. Only set by
+    # _advance_load_encoder; existing prefill/decode/agg paths leave this None.
+    num_encode: Optional[int] = None
 
 
 @dataclass
@@ -128,6 +140,11 @@ class TickDiagnostics:
     load_decision_reason_decode: Optional[str] = None
     throughput_decision_reason_prefill: Optional[str] = None
     throughput_decision_reason_decode: Optional[str] = None
+    # exp-4 (encoder autoscaler): encoder-pool scale-down reason +
+    # debug fields for the idle-tick counter and last in-flight reading.
+    load_decision_reason_encode: Optional[str] = None
+    encode_in_flight: Optional[int] = None
+    encode_idle_ticks: Optional[int] = None
 
 
 @dataclass

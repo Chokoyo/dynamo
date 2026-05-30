@@ -71,6 +71,10 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
         self._is_agg = config.mode == "agg"
         self._has_prefill = config.mode in ("disagg", "prefill")
         self._has_decode = config.mode in ("disagg", "decode", "agg")
+        # exp-4 (encoder autoscaler): the encoder pool is opt-in via the new
+        # "encode" mode in EncoderPlanner. Existing prefill/decode/agg/disagg
+        # planners never set this and the encoder branch is a no-op for them.
+        self._has_encoder = config.mode == "encode"
         self._is_easy = config.optimization_target != "sla"
 
         # Easy mode uses static thresholds -- no regression or predictors needed
@@ -107,6 +111,19 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
         self._num_d_workers: int = 0
         self._expected_num_p: Optional[int] = None
         self._expected_num_d: Optional[int] = None
+        # exp-4 (encoder autoscaler): encoder pool inventory + idle counter.
+        # ``_encode_idle_ticks`` tracks consecutive ticks where the encoder
+        # gauge read 0 in-flight; when it hits ``_encode_scale_down_ticks``
+        # and replicas > min_endpoint, _advance_load_encoder drops one.
+        self._num_e_workers: int = 0
+        self._expected_num_e: Optional[int] = None
+        self._last_encode_in_flight: Optional[int] = None
+        self._encode_idle_ticks: int = 0
+        # K from R4: 3 consecutive load ticks of 0 in-flight => scale down.
+        # On a 5-s load cadence this is 15 s of idleness before the controller
+        # reclaims a replica -- short enough to make P1 (180 s text-only)
+        # almost fully reclaimable; cold-start risk handled by min_endpoint.
+        self._encode_scale_down_ticks: int = 3
 
         self._throughput_lower_bound_p: int = 1
         self._throughput_lower_bound_d: int = 1
@@ -135,6 +152,8 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
         self._diag_load_reason_decode: Optional[str] = None
         self._diag_throughput_reason_prefill: Optional[str] = None
         self._diag_throughput_reason_decode: Optional[str] = None
+        # exp-4 (encoder autoscaler): scratch reason for the encoder branch.
+        self._diag_load_reason_encode: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -251,6 +270,7 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
         self._diag_load_reason_decode = None
         self._diag_throughput_reason_prefill = None
         self._diag_throughput_reason_decode = None
+        self._diag_load_reason_encode = None
 
     def _build_diagnostics(self) -> TickDiagnostics:
         return TickDiagnostics(
@@ -270,6 +290,9 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
             load_decision_reason_decode=self._diag_load_reason_decode,
             throughput_decision_reason_prefill=self._diag_throughput_reason_prefill,
             throughput_decision_reason_decode=self._diag_throughput_reason_decode,
+            load_decision_reason_encode=self._diag_load_reason_encode,
+            encode_in_flight=self._last_encode_in_flight,
+            encode_idle_ticks=self._encode_idle_ticks,
         )
 
     # ------------------------------------------------------------------
@@ -319,12 +342,24 @@ class PlannerStateMachine(LoadScalingMixin, ThroughputScalingMixin):
             self._num_d_workers = counts.ready_num_decode
         self._expected_num_p = counts.expected_num_prefill
         self._expected_num_d = counts.expected_num_decode
+        # exp-4 (encoder autoscaler): encoder inventory + live in-flight
+        # gauge. Both fields are ``None`` for non-multimodal deployments.
+        if counts.ready_num_encode is not None:
+            self._num_e_workers = counts.ready_num_encode
+        self._expected_num_e = counts.expected_num_encode
+        if counts.encode_in_flight is not None:
+            self._last_encode_in_flight = counts.encode_in_flight
 
     def _scaling_in_progress(self, component: str) -> bool:
         if component == "prefill":
             return (
                 self._expected_num_p is not None
                 and self._expected_num_p != self._num_p_workers
+            )
+        if component == "encode":
+            return (
+                self._expected_num_e is not None
+                and self._expected_num_e != self._num_e_workers
             )
         return (
             self._expected_num_d is not None

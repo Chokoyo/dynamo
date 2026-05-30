@@ -65,7 +65,11 @@ class PlannerConfig(BaseModel):
         exclude=True,
     )
     backend: Literal["vllm", "sglang", "trtllm", "mocker"] = SLAPlannerDefaults.backend
-    mode: Literal["disagg", "prefill", "decode", "agg"] = SLAPlannerDefaults.mode
+    # exp-4 (encoder autoscaler): "encode" mode runs the EncoderPlanner with
+    # scale-DOWN-only load logic. Existing modes are unchanged.
+    mode: Literal[
+        "disagg", "prefill", "decode", "agg", "encode"
+    ] = SLAPlannerDefaults.mode
     optimization_target: Literal["throughput", "latency", "load", "sla"] = Field(
         default="throughput",
         description=(

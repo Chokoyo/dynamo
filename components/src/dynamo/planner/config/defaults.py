@@ -72,7 +72,10 @@ class SLAPlannerDefaults(BasePlannerDefaults):
     kalman_r = 10.0
     kalman_min_points = 5
 
-    mode: Literal["disagg", "prefill", "decode", "agg"] = "disagg"
+    # exp-4 (encoder autoscaler): "encode" is the EncoderPlanner-only mode.
+    # The encoder branch in _advance_load is keyed off this value; existing
+    # disagg/prefill/decode/agg paths are unchanged.
+    mode: Literal["disagg", "prefill", "decode", "agg", "encode"] = "disagg"
 
     throughput_metrics_source: Literal["frontend", "router"] = "frontend"
 
@@ -103,6 +106,10 @@ class SLAPlannerDefaults(BasePlannerDefaults):
 class SubComponentType(str, Enum):
     PREFILL = "prefill"
     DECODE = "decode"
+    # exp-4 (encoder autoscaler): encoder pool is a third sub-component on
+    # multimodal deployments. Defensive: only routed by EncoderPlanner /
+    # _advance_load_encoder; existing prefill/decode/agg paths ignore it.
+    ENCODER = "encode"
 
 
 class TargetReplica(BaseModel):

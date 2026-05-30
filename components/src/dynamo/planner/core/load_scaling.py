@@ -43,6 +43,14 @@ class LoadScalingMixin:
     _diag_load_reason: Optional[str]
     _diag_load_reason_prefill: Optional[str]
     _diag_load_reason_decode: Optional[str]
+    # exp-4 (encoder autoscaler): see PlannerStateMachine.__init__.
+    _diag_load_reason_encode: Optional[str]
+    _has_encoder: bool
+    _num_e_workers: int
+    _expected_num_e: Optional[int]
+    _last_encode_in_flight: Optional[int]
+    _encode_idle_ticks: int
+    _encode_scale_down_ticks: int
 
     def _advance_load(self, obs: FpmObservations) -> Optional[ScalingDecision]:
         if not self._config.enable_load_scaling:
@@ -53,7 +61,89 @@ class LoadScalingMixin:
             return self._advance_load_agg(obs)
         if mode == "disagg":
             return self._advance_load_disagg(obs)
+        # exp-4 (encoder autoscaler): the "encode" mode runs the scale-DOWN
+        # only controller from R4. Dispatched here so the prefill/decode/agg
+        # paths stay untouched.
+        if mode == "encode":
+            return self._advance_load_encoder(obs)
         return self._advance_load_single(obs, mode)
+
+    # ------------------------------------------------------------------
+    # Encoder pool scale-DOWN (exp-4)
+    # ------------------------------------------------------------------
+
+    def _advance_load_encoder(
+        self, obs: FpmObservations
+    ) -> Optional[ScalingDecision]:
+        """Scale-DOWN controller for the multimodal encoder pool.
+
+        Trigger: ``encode_in_flight == 0`` for K consecutive load ticks AND
+        ``replicas > min_endpoint`` => drop one replica. R4 measured 100 %
+        encoder idle time during the 180 s text-only phase (P1) of the
+        text-heavy trace; this controller reclaims that GPU.
+
+        Defensive no-ops (controller returns None without changing state):
+          - encoder sub-component not configured (``_has_encoder`` False)
+            or never reported by the adapter (``ready_num_encode is None``
+            on the most recent inventory tick, leaving ``_num_e_workers == 0``).
+          - a scaling action is already in flight (expected != ready).
+          - the in-flight gauge hasn't been observed yet on this tick.
+          - replicas already at the floor (``min_endpoint``).
+
+        Scale-UP is NOT in this controller. R2/R3 showed Qwen2.5-VL-3B and
+        LLaVA-7B encoders absorb the burst trace at <5 % util, so a scale-up
+        trigger would never legitimately fire; landing it would only invite
+        spurious GPU spend. Future heavier-encoder work (PLAN.md §3.A path
+        2) can extend this with a queue-depth branch.
+        """
+        del obs  # encoder controller is driven by the live in-flight gauge
+        if not self._has_encoder:
+            self._diag_load_reason_encode = "no_encoder_subcomponent"
+            return None
+        if self._scaling_in_progress("encode"):
+            self._diag_load_reason_encode = "scaling_in_progress"
+            return None
+        if self._num_e_workers <= 0:
+            self._diag_load_reason_encode = "no_encoder_workers"
+            return None
+
+        in_flight = self._last_encode_in_flight
+        if in_flight is None:
+            self._diag_load_reason_encode = "no_in_flight_metric"
+            return None
+
+        if in_flight > 0:
+            # Activity observed -- reset the idle counter. Future scale-UP
+            # logic would also live in this branch.
+            self._encode_idle_ticks = 0
+            self._diag_load_reason_encode = "active"
+            return None
+
+        # in_flight == 0 on this tick: accumulate idle ticks.
+        self._encode_idle_ticks += 1
+        floor = max(1, self._config.min_endpoint)
+        if self._num_e_workers <= floor:
+            self._diag_load_reason_encode = "idle_but_at_floor"
+            return None
+        if self._encode_idle_ticks < self._encode_scale_down_ticks:
+            self._diag_load_reason_encode = "idle_accumulating"
+            return None
+
+        desired = self._num_e_workers - 1
+        logger.info(
+            "Encoder load scaling: idle for %d ticks (>= K=%d), "
+            "scale down %d -> %d",
+            self._encode_idle_ticks,
+            self._encode_scale_down_ticks,
+            self._num_e_workers,
+            desired,
+        )
+        # Reset the counter so the next decision waits another K idle ticks.
+        # This also caps the per-tick action at 1 replica drop (hysteresis).
+        self._encode_idle_ticks = 0
+        self._diag_load_reason_encode = "scale_down"
+        self._diag_load_reason = "scale_down"
+        return ScalingDecision(num_encode=desired)
 
     def _advance_load_single(
         self, obs: FpmObservations, component: str

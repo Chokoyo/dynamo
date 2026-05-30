@@ -25,6 +25,7 @@ from dynamo.planner.core.adapters import (
     AggPlanner,
     DecodePlanner,
     DisaggPlanner,
+    EncoderPlanner,
     PrefillPlanner,
 )
 from dynamo.runtime import DistributedRuntime, dynamo_worker
@@ -38,7 +39,9 @@ class RequestType(BaseModel):
 
 async def start_planner(runtime: DistributedRuntime, config: PlannerConfig):
     mode = config.mode
-    planner: Union[DisaggPlanner, PrefillPlanner, DecodePlanner, AggPlanner]
+    planner: Union[
+        DisaggPlanner, PrefillPlanner, DecodePlanner, AggPlanner, EncoderPlanner
+    ]
     if mode == "disagg":
         planner = DisaggPlanner(runtime, config)
     elif mode == "prefill":
@@ -47,6 +50,10 @@ async def start_planner(runtime: DistributedRuntime, config: PlannerConfig):
         planner = DecodePlanner(runtime, config)
     elif mode == "agg":
         planner = AggPlanner(runtime, config)
+    elif mode == "encode":
+        # exp-4 (encoder autoscaler): runs the EncoderPlanner with the
+        # scale-DOWN-only branch in _advance_load_encoder.
+        planner = EncoderPlanner(runtime, config)
     else:
         raise ValueError(f"Invalid planner mode: {mode}")
 
