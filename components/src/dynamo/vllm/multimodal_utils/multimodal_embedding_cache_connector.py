@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import logging
+import os
+import tempfile
+import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -23,6 +28,27 @@ if TYPE_CHECKING:
 MINIMUM_VLLM_VERSION = "0.17.0"
 
 logger = logging.getLogger(__name__)
+
+# Round-3 instrumentation (exp-3): the scheduler-authoritative connector lives
+# inside the vLLM EngineCore subprocess so its in-memory counters are invisible
+# to the Dynamo Prometheus callback (which runs in the API-server process).
+# Bridge the two with an atomically-written JSON snapshot at a well-known path.
+# The Prometheus scrape callback (registered in worker_factory.py) reads the
+# same file. See exp-3 RESULTS.md §3 for the gap this closes.
+_EC_CONNECTOR_STATS_ENV = "DYN_EC_CONNECTOR_STATS_PATH"
+
+
+def _default_stats_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "dyn_ec_connector_stats.json")
+
+
+def resolve_ec_connector_stats_path() -> str:
+    """Return the path the connector writes its stats snapshot to.
+
+    Honors ``$DYN_EC_CONNECTOR_STATS_PATH`` so the launcher can isolate
+    per-job state. Also consumed by ``register_ec_connector_metrics``.
+    """
+    return os.environ.get(_EC_CONNECTOR_STATS_ENV, _default_stats_path())
 
 
 @dataclass
@@ -92,12 +118,40 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         # --- Worker-side: dumb CPU tensor store ---
         self._cpu_store: dict[str, torch.Tensor] = {}
 
+        # --- Round-3 instrumentation: monotonic stats + JSON snapshot file ---
+        # All counters are monotonic; the Prometheus side computes deltas.
+        # "hits" = CPU cache hits (scheduler skips encoder, loads from CPU store).
+        # "misses" = CPU cache misses (scheduler dispatches the encoder).
+        # "evictions" = entries pushed out of the LRU to make room.
+        self._stats_lock = threading.Lock()
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "lookups": 0,
+        }
+        self._stats_path = resolve_ec_connector_stats_path()
+        self._capacity_gb = capacity_gb
+        # Buffer of events flushed alongside the stats snapshot (patch 2).
+        # See _emit_event(): one event per save and one per evict, dropped after
+        # being read by the scrape callback. Capped to avoid unbounded growth
+        # if the consumer is wedged.
+        self._event_buf_max = 2048
+        self._event_buf: list[dict] = []
+        self._engine_id = getattr(transfer_config, "engine_id", "") or ""
+        # Write an initial all-zeros snapshot so the consumer never sees the
+        # file as missing right after startup.
+        self._flush_stats_snapshot()
+
         logger.info(
             "DynamoMultimodalEmbeddingCacheConnector initialized: "
-            "capacity_gb=%.2f, capacity_bytes=%d, bytes_per_embed=%d",
+            "capacity_gb=%.2f, capacity_bytes=%d, bytes_per_embed=%d, "
+            "stats_path=%s engine_id=%s",
             capacity_gb,
             self._capacity_bytes,
             self._bytes_per_embed,
+            self._stats_path,
+            self._engine_id,
         )
 
     # ==============================
@@ -118,6 +172,68 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
     #      - encoder_inputs_to_schedule  → mm_hash NOT in _cache_order → save path
     # ==============================
 
+    # ---- Round-3 instrumentation helpers (internal) ----
+
+    def _emit_event(self, kind: str, mm_hash: str, size_bytes: int = 0) -> None:
+        """Patch-2 stretch: buffer an EmbeddingEvent for the event-plane plumbing.
+
+        Format intentionally mirrors KV-Events: a flat dict with a discriminator
+        plus a few small fields. The buffer is drained on the next stats flush.
+        """
+        ev = {
+            "kind": kind,
+            "mm_hash": mm_hash,
+            "size_bytes": size_bytes,
+            "engine_id": self._engine_id,
+            "ts": time.time(),
+        }
+        if len(self._event_buf) < self._event_buf_max:
+            self._event_buf.append(ev)
+
+    def _flush_stats_snapshot(self) -> None:
+        """Atomically write the current stats + buffered events to disk.
+
+        Format::
+            {
+              "stats": {"hits": int, "misses": int, "evictions": int, ...},
+              "gauges": {"entries": int, "current_bytes": int,
+                         "capacity_bytes": int, "utilization": float},
+              "events": [ {kind, mm_hash, size_bytes, engine_id, ts}, ... ],
+              "ts": float
+            }
+
+        Atomicity: write to a temp sibling then ``os.replace`` so the consumer
+        never reads a half-written file.
+        """
+        with self._stats_lock:
+            entries = len(self._cache_order)
+            used = self._num_used_bytes
+            util = (
+                (used / self._capacity_bytes) if self._capacity_bytes > 0 else 0.0
+            )
+            payload = {
+                "stats": dict(self._stats),
+                "gauges": {
+                    "entries": entries,
+                    "current_bytes": used,
+                    "capacity_bytes": self._capacity_bytes,
+                    "utilization": util,
+                },
+                "events": list(self._event_buf),
+                "ts": time.time(),
+                "engine_id": self._engine_id,
+            }
+            self._event_buf.clear()
+
+        try:
+            tmp = f"{self._stats_path}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._stats_path)
+        except Exception as exc:
+            # Never let metric I/O break the scheduler.
+            logger.debug("ec-connector stats flush failed: %s", exc)
+
     def has_cache_item(self, identifier: str) -> bool:
         """Check if an embedding is in the CPU cache, promoting it to MRU on hit.
 
@@ -125,10 +241,14 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         a miss. A True return tells the scheduler to skip encoder compute and
         load the embedding from the CPU store instead.
         """
-        if identifier in self._cache_order:
-            self._cache_order.move_to_end(identifier)
-            return True
-        return False
+        with self._stats_lock:
+            self._stats["lookups"] += 1
+            if identifier in self._cache_order:
+                self._stats["hits"] += 1
+                self._cache_order.move_to_end(identifier)
+                return True
+            self._stats["misses"] += 1
+            return False
 
     def update_state_after_alloc(self, request: "Request", index: int) -> None:
         """Record a load or save command for a multimodal feature.
@@ -162,9 +282,13 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
             evicted_hash, evicted_bytes = self._cache_order.popitem(last=False)
             self._num_used_bytes -= evicted_bytes
             self._evicts_this_step.add(evicted_hash)
+            with self._stats_lock:
+                self._stats["evictions"] += 1
+            self._emit_event("evict", evicted_hash, evicted_bytes)
 
         self._cache_order[mm_hash] = size_bytes
         self._num_used_bytes += size_bytes
+        self._emit_event("save", mm_hash, size_bytes)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -179,6 +303,11 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         self._loads_this_step.clear()
         self._saves_this_step.clear()
         self._evicts_this_step.clear()
+
+        # Round-3 instrumentation: persist the latest stats snapshot so the
+        # Prometheus scrape callback (worker_factory.py) can read it.
+        # Cheap (<1 ms): single small JSON file, one fsync-free os.replace.
+        self._flush_stats_snapshot()
         return meta
 
     # ==============================

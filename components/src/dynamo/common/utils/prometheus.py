@@ -48,6 +48,22 @@ class EmbeddingCacheMetrics(str, enum.Enum):
     ENTRIES = f"{name_prefix.COMPONENT}_embedding_cache_entries"
 
 
+# Round-3 (exp-3): metric names for the SCHEDULER-AUTHORITATIVE connector cache
+# (DynamoMultimodalEmbeddingCacheConnector). These shadow the names above but
+# use the distinct ``ec_connector_`` infix so operators can tell which cache
+# layer reported the hit. See exp-3 RESULTS.md §3.
+class EcConnectorMetrics(str, enum.Enum):
+    """Prometheus metric names for the scheduler-side EC connector cache."""
+
+    HITS_TOTAL = f"{name_prefix.COMPONENT}_ec_connector_cache_hits_total"
+    MISSES_TOTAL = f"{name_prefix.COMPONENT}_ec_connector_cache_misses_total"
+    EVICTIONS_TOTAL = f"{name_prefix.COMPONENT}_ec_connector_cache_evictions_total"
+    UTILIZATION = f"{name_prefix.COMPONENT}_ec_connector_cache_utilization"
+    CURRENT_BYTES = f"{name_prefix.COMPONENT}_ec_connector_cache_current_bytes"
+    ENTRIES = f"{name_prefix.COMPONENT}_ec_connector_cache_entries"
+    EVENTS_TOTAL = f"{name_prefix.COMPONENT}_ec_connector_events_total"
+
+
 def register_engine_metrics_callback(
     endpoint: Endpoint,
     registry: "CollectorRegistry",
@@ -519,4 +535,127 @@ def register_embedding_cache_metrics(
         "Registered embedding cache metrics (model=%s, component=%s)",
         model_name,
         component_name,
+    )
+
+
+def register_ec_connector_metrics(
+    endpoint: "Endpoint",
+    stats_path: str,
+    model_name: str = "",
+    component_name: str = "",
+) -> None:
+    """Register Prometheus metrics for ``DynamoMultimodalEmbeddingCacheConnector``.
+
+    The connector lives inside the vLLM EngineCore subprocess and writes a
+    small JSON snapshot to ``stats_path`` on every ``build_connector_meta()``.
+    This function registers a Prometheus expfmt callback that reads that file
+    on each /metrics scrape and translates the snapshot into Counter/Gauge
+    values.
+
+    The metric names are deliberately distinct from
+    ``register_embedding_cache_metrics`` (which observes the *loader-side*
+    cache in ``handlers.py``). Reported as ``dynamo_component_ec_connector_*``.
+    """
+    import json as _json
+    import os as _os
+
+    from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
+
+    registry = CollectorRegistry()
+    label_names = [labels.MODEL, labels.COMPONENT]
+    label_values = {labels.MODEL: model_name, labels.COMPONENT: component_name}
+
+    M = EcConnectorMetrics
+
+    hits_c = Counter(
+        M.HITS_TOTAL, "Total scheduler-side connector CPU-cache hits.",
+        labelnames=label_names, registry=registry,
+    )
+    miss_c = Counter(
+        M.MISSES_TOTAL, "Total scheduler-side connector CPU-cache misses.",
+        labelnames=label_names, registry=registry,
+    )
+    evict_c = Counter(
+        M.EVICTIONS_TOTAL, "Total scheduler-side connector CPU-cache evictions.",
+        labelnames=label_names, registry=registry,
+    )
+    util_g = Gauge(
+        M.UTILIZATION, "Connector CPU-cache memory utilization ratio (0.0-1.0).",
+        labelnames=label_names, registry=registry,
+    )
+    bytes_g = Gauge(
+        M.CURRENT_BYTES, "Current connector CPU-cache memory usage in bytes.",
+        labelnames=label_names, registry=registry,
+    )
+    entries_g = Gauge(
+        M.ENTRIES, "Current number of entries in the connector CPU cache.",
+        labelnames=label_names, registry=registry,
+    )
+    events_c = Counter(
+        M.EVENTS_TOTAL,
+        "Total EmbeddingEvents emitted by the connector (save/evict).",
+        labelnames=[labels.MODEL, labels.COMPONENT, "event_kind"],
+        registry=registry,
+    )
+
+    # Initialize labels so zeros appear from the first scrape.
+    hits_c.labels(**label_values)
+    miss_c.labels(**label_values)
+    evict_c.labels(**label_values)
+    events_c.labels(**label_values, event_kind="save")
+    events_c.labels(**label_values, event_kind="evict")
+
+    lock = threading.Lock()
+    prev = {"hits": 0, "misses": 0, "evictions": 0}
+    event_counts = {"save": 0, "evict": 0}
+
+    def _read_snapshot() -> Optional[dict]:
+        try:
+            if not _os.path.exists(stats_path):
+                return None
+            with open(stats_path, "r") as f:
+                return _json.load(f)
+        except Exception as exc:
+            logging.debug("ec-connector stats read failed: %s", exc)
+            return None
+
+    def _collect() -> str:
+        with lock:
+            snap = _read_snapshot()
+            if snap is not None:
+                stats = snap.get("stats", {})
+                gauges = snap.get("gauges", {})
+
+                # Counter deltas (monotonic source).
+                for key, counter in (
+                    ("hits", hits_c),
+                    ("misses", miss_c),
+                    ("evictions", evict_c),
+                ):
+                    cur = int(stats.get(key, 0))
+                    delta = cur - prev[key]
+                    if delta > 0:
+                        counter.labels(**label_values).inc(delta)
+                    prev[key] = cur
+
+                # Per-event counters (patch 2 substrate). The connector writes a
+                # rolling buffer of events; count them as they are seen.
+                for ev in snap.get("events", []):
+                    kind = ev.get("kind")
+                    if kind in event_counts:
+                        events_c.labels(**label_values, event_kind=kind).inc()
+                        event_counts[kind] += 1
+
+                util_g.labels(**label_values).set(float(gauges.get("utilization", 0.0)))
+                bytes_g.labels(**label_values).set(int(gauges.get("current_bytes", 0)))
+                entries_g.labels(**label_values).set(int(gauges.get("entries", 0)))
+
+            return generate_latest(registry).decode("utf-8")
+
+    endpoint.metrics.register_prometheus_expfmt_callback(_collect)
+    logging.info(
+        "Registered EC-connector metrics (model=%s, component=%s, stats_path=%s)",
+        model_name,
+        component_name,
+        stats_path,
     )

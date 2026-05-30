@@ -19,6 +19,7 @@ from dynamo import prometheus_names
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
 from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
+    register_ec_connector_metrics,
     register_embedding_cache_metrics,
 )
 from dynamo.llm import ModelInput, ModelType
@@ -368,6 +369,26 @@ class WorkerFactory:
                 component_name=config.component,
             )
 
+        # Round-3 (exp-3): scheduler-authoritative connector metrics.
+        # The connector lives in the vLLM EngineCore subprocess and persists a
+        # JSON stats snapshot at $DYN_EC_CONNECTOR_STATS_PATH. Register a
+        # Prometheus scrape callback that reads that file. Mirrors the gate
+        # in main.py that instantiates the connector itself.
+        if (
+            not getattr(config, "route_to_encoder", False)
+            and getattr(config, "multimodal_embedding_cache_capacity_gb", 0) > 0
+        ):
+            from .multimodal_utils.multimodal_embedding_cache_connector import (
+                resolve_ec_connector_stats_path,
+            )
+
+            register_ec_connector_metrics(
+                endpoint=generate_endpoint,
+                stats_path=resolve_ec_connector_stats_path(),
+                model_name=config.served_model_name or config.model,
+                component_name=config.component,
+            )
+
         # Register engine routes
         self.register_engine_routes(runtime, handler)
 
@@ -575,6 +596,26 @@ class WorkerFactory:
             register_embedding_cache_metrics(
                 endpoint=generate_endpoint,
                 cache=embedding_cache,
+                model_name=config.served_model_name or config.model,
+                component_name=config.component,
+            )
+
+        # Round-3 (exp-3): scheduler-authoritative connector metrics.
+        # The connector lives in the vLLM EngineCore subprocess and persists a
+        # JSON stats snapshot at $DYN_EC_CONNECTOR_STATS_PATH. Register a
+        # Prometheus scrape callback that reads that file. Mirrors the gate
+        # in main.py that instantiates the connector itself.
+        if (
+            not getattr(config, "route_to_encoder", False)
+            and getattr(config, "multimodal_embedding_cache_capacity_gb", 0) > 0
+        ):
+            from .multimodal_utils.multimodal_embedding_cache_connector import (
+                resolve_ec_connector_stats_path,
+            )
+
+            register_ec_connector_metrics(
+                endpoint=generate_endpoint,
+                stats_path=resolve_ec_connector_stats_path(),
                 model_name=config.served_model_name or config.model,
                 component_name=config.component,
             )
