@@ -359,15 +359,46 @@ async def parse_args(args: list[str]) -> Config:
         server_args.enable_metrics = getattr(parsed_args, "enable_metrics", False)
         server_args.log_level = getattr(parsed_args, "log_level", "info")
         server_args.kv_events_config = getattr(parsed_args, "kv_events_config", None)
-        server_args.tp_size = getattr(parsed_args, "tp_size", 1)
-        server_args.dp_size = getattr(parsed_args, "dp_size", 1)
+        cli_tp = int(getattr(parsed_args, "tp_size", 1) or 1)
+        cli_dp = int(getattr(parsed_args, "dp_size", 1) or 1)
+        # For video generation, DiffGenerator does not use weight-sharding TP;
+        # instead, multi-GPU is best exploited via Ulysses sequence-parallelism
+        # for the DiT (Wan video). The dynamo.sglang `--tp N` flag previously
+        # fell into the LLM TP slot, where the diffusion init then dropped it
+        # silently (DiffGenerator's `sp_degree/ulysses_degree/ring_degree`
+        # stayed at 1; runtime log showed world_size=1 despite --tp N).
+        #
+        # Wire --tp N -> ulysses_degree=N, sp_degree=N, tp_size=1, num_gpus=N
+        # for video workers. Image diffusion keeps tp_size=N pass-through
+        # (existing semantics for image DiT TP).
+        if video_generation_worker and cli_tp > 1:
+            server_args.tp_size = 1
+            server_args.dp_size = cli_dp
+            server_args.ulysses_degree = cli_tp
+            server_args.ring_degree = 1
+            server_args.sp_degree = cli_tp  # = ulysses_degree * ring_degree
+            server_args.num_gpus = cli_tp * cli_dp
+            logging.info(
+                f"Video worker: routing --tp {cli_tp} -> ulysses_degree={cli_tp}, "
+                f"sp_degree={cli_tp}, ring_degree=1, num_gpus={server_args.num_gpus}"
+            )
+        else:
+            server_args.tp_size = cli_tp
+            server_args.dp_size = cli_dp
+            server_args.ulysses_degree = 1
+            server_args.ring_degree = 1
+            server_args.sp_degree = 1
+            server_args.num_gpus = cli_tp * cli_dp
         server_args.speculative_algorithm = None
         server_args.disaggregation_mode = None
         server_args.dllm_algorithm = False
         server_args.load_format = None
         server_args.enable_trace = getattr(parsed_args, "enable_trace", False)
         logging.info(
-            f"Created stub ServerArgs for {worker_type}: model_path={server_args.model_path}"
+            f"Created stub ServerArgs for {worker_type}: model_path={server_args.model_path} "
+            f"num_gpus={server_args.num_gpus} tp={server_args.tp_size} "
+            f"ulysses={server_args.ulysses_degree} ring={server_args.ring_degree} "
+            f"sp={server_args.sp_degree} dp={server_args.dp_size}"
         )
     else:
         server_args = ServerArgs.from_cli_args(parsed_args)

@@ -222,15 +222,31 @@ async def init_video_diffusion(
 
     tp_size = getattr(server_args, "tp_size", 1)
     dp_size = getattr(server_args, "dp_size", 1)
-    num_gpus = tp_size * dp_size
+    ulysses_degree = getattr(server_args, "ulysses_degree", 1)
+    ring_degree = getattr(server_args, "ring_degree", 1)
+    sp_degree = getattr(server_args, "sp_degree", ulysses_degree * ring_degree)
+    # Prefer the explicit num_gpus set by the args stub when present;
+    # otherwise fall back to the prior tp*dp computation.
+    num_gpus = getattr(server_args, "num_gpus", None) or (
+        tp_size * dp_size * sp_degree
+    )
 
     dist_timeout = getattr(server_args, "dist_timeout", None)
+
+    logging.info(
+        f"Video DiffGenerator launch: num_gpus={num_gpus} tp_size={tp_size} "
+        f"dp_size={dp_size} ulysses_degree={ulysses_degree} "
+        f"ring_degree={ring_degree} sp_degree={sp_degree}"
+    )
 
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path,
         num_gpus=num_gpus,
         tp_size=tp_size,
         dp_size=dp_size,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        sp_degree=sp_degree,
         dist_timeout=dist_timeout,
     )
 
