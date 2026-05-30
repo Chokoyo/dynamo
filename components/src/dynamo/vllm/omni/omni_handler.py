@@ -279,6 +279,28 @@ class OmniHandler(BaseOmniHandler):
             sampling_params_list = self._build_sampling_params_list(sp)
         else:
             prompt = OmniTextPrompt(prompt=text_prompt)
+            audio_urls = self._extract_audio_urls(request)
+            if audio_urls:
+                # Pass raw URLs through using Dynamo's canonical
+                # ``audio_url`` multi-modal shape (matches
+                # ``dynamo.frontend.utils.extract_mm_urls`` output). The
+                # frontend's AudioLoader resolves these into
+                # ``(waveform, sample_rate)`` tuples before the engine sees
+                # them; here we are intentionally URL-shaped so the existing
+                # decode path remains the single source of truth.
+                # NOTE: if upstream multi_modal_data was already attached to
+                # the request (e.g. a pre-decoded audio_url payload from
+                # frontend NIXL), we merge rather than overwrite.
+                mmd: dict = dict(request.get("multi_modal_data") or {})
+                mmd.setdefault("audio_url", [])
+                mmd["audio_url"] = list(mmd["audio_url"]) + [
+                    {"Url": url} for url in audio_urls
+                ]
+                prompt["multi_modal_data"] = mmd
+                logger.info(
+                    "omni audio-in: attached %d audio_url part(s) to chat prompt",
+                    len(audio_urls),
+                )
             sampling_params_list = None
 
         return EngineInputs(

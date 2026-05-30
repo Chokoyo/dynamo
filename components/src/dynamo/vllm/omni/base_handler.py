@@ -128,13 +128,80 @@ class BaseOmniHandler(BaseWorkerHandler[Dict[str, Any], Dict[str, Any]]):
     def _extract_text_prompt(self, request: Dict[str, Any]) -> str | None:
         """Extract text prompt from OpenAI messages format.
 
-        Looks for the last user message and returns its text content.
+        Looks for the last user message and returns its text content. Accepts
+        both legacy string content and OpenAI-style content arrays. When the
+        content is an array, joins all parts of ``type == "text"`` with single
+        spaces; non-text parts (``audio_url``/``input_audio``/``image_url``/
+        ``video_url``) are ignored here and recovered separately by
+        :meth:`_extract_audio_urls` and friends.
         """
         messages = request.get("messages", [])
         for message in reversed(messages):
-            if message.get("role") == "user":
-                return message.get("content")
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if content is None:
+                return None
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                texts: list[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text":
+                        t = part.get("text")
+                        if isinstance(t, str) and t:
+                            texts.append(t)
+                return " ".join(texts) if texts else ""
+            return None
         return None
+
+    def _extract_audio_urls(self, request: Dict[str, Any]) -> list[str]:
+        """Extract audio URLs from the latest user message.
+
+        Supports two content-part shapes:
+
+        * Dynamo / multi-vendor convention -- ``{"type": "audio_url",
+          "audio_url": {"url": "<uri>"}}`` (matches
+          :mod:`dynamo.frontend.utils.extract_mm_urls`).
+        * OpenAI Realtime convention -- ``{"type": "input_audio",
+          "input_audio": {"data": "<base64>", "format": "wav"}}``. Decoded into
+          a ``data:audio/<format>;base64,<data>`` URI so downstream
+          :class:`~dynamo.common.multimodal.AudioLoader` can decode it via the
+          same code path as ``audio_url``.
+
+        Returns the list of audio URI strings, in order of appearance in the
+        last user message. Empty list if no audio parts found.
+        """
+        messages = request.get("messages", [])
+        urls: list[str] = []
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                return urls
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "audio_url":
+                    audio_url = part.get("audio_url")
+                    if isinstance(audio_url, dict):
+                        url = audio_url.get("url")
+                        if isinstance(url, str) and url:
+                            urls.append(url)
+                elif part_type == "input_audio":
+                    input_audio = part.get("input_audio")
+                    if not isinstance(input_audio, dict):
+                        continue
+                    data = input_audio.get("data")
+                    fmt = input_audio.get("format", "wav")
+                    if isinstance(data, str) and data:
+                        urls.append(f"data:audio/{fmt};base64,{data}")
+            return urls
+        return urls
 
     def _extract_extra_body(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Extract extra_body parameters from the request.
