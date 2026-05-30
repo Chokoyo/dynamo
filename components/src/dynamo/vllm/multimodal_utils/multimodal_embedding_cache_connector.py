@@ -146,6 +146,27 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         # Robust against unit tests that pass a MagicMock for transfer_config.
         _eid = getattr(transfer_config, "engine_id", "")
         self._engine_id = _eid if isinstance(_eid, str) else ""
+
+        # --- Round-4 stretch: optional ZMQ PUB EmbeddingEvent publisher. ---
+        # Disabled unless $DYN_EC_EVENT_PUB_ENDPOINT is set. Provides the
+        # cross-process event substrate that the file-bridge cannot (R5
+        # cross-replica router will subscribe here).
+        try:
+            from dynamo.common.multimodal.embedding_event_publisher import (
+                EmbeddingEventPublisher,
+            )
+
+            self._event_publisher = EmbeddingEventPublisher(
+                engine_id=self._engine_id,
+            )
+        except Exception as exc:
+            logger.debug(
+                "EmbeddingEventPublisher import/construct failed: %s", exc
+            )
+            self._event_publisher = None
+        self._stats["events_published"] = 0
+        self._stats["events_dropped"] = 0
+
         # Write an initial all-zeros snapshot so the consumer never sees the
         # file as missing right after startup.
         self._flush_stats_snapshot()
@@ -153,12 +174,13 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         logger.info(
             "DynamoMultimodalEmbeddingCacheConnector initialized: "
             "capacity_gb=%.2f, capacity_bytes=%d, bytes_per_embed=%d, "
-            "stats_path=%s engine_id=%s",
+            "stats_path=%s engine_id=%s pub_enabled=%s",
             capacity_gb,
             self._capacity_bytes,
             self._bytes_per_embed,
             self._stats_path,
             self._engine_id,
+            bool(self._event_publisher and getattr(self._event_publisher, "_endpoint", None)),
         )
 
     # ==============================
@@ -182,10 +204,17 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
     # ---- Round-3 instrumentation helpers (internal) ----
 
     def _emit_event(self, kind: str, mm_hash: str, size_bytes: int = 0) -> None:
-        """Patch-2 stretch: buffer an EmbeddingEvent for the event-plane plumbing.
+        """Emit an EmbeddingEvent for the event-plane plumbing.
 
         Format intentionally mirrors KV-Events: a flat dict with a discriminator
-        plus a few small fields. The buffer is drained on the next stats flush.
+        plus a few small fields. The dict is
+
+          1. counted into the monotonic ``events_{kind}`` stats counter (R3,
+             observable via Prometheus).
+          2. buffered into ``self._event_buf`` and persisted in the next
+             ``_flush_stats_snapshot()`` (R3 file-bridge).
+          3. published (best-effort, non-blocking) on the ZMQ PUB socket
+             managed by ``self._event_publisher`` if configured (R4 stretch).
         """
         ev = {
             "kind": kind,
@@ -201,6 +230,14 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
                 self._stats[key] += 1
         if len(self._event_buf) < self._event_buf_max:
             self._event_buf.append(ev)
+        # R4: optional ZMQ PUB dissemination. No-op if endpoint not set.
+        if self._event_publisher is not None:
+            self._event_publisher.publish(ev)
+            # Mirror pub counters into stats so they end up in the snapshot
+            # file and Prometheus can surface them. Cheap attribute reads.
+            with self._stats_lock:
+                self._stats["events_published"] = self._event_publisher.published
+                self._stats["events_dropped"] = self._event_publisher.dropped
 
     def _flush_stats_snapshot(self) -> None:
         """Atomically write the current stats + buffered events to disk.
