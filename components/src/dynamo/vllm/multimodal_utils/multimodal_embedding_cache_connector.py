@@ -138,7 +138,9 @@ class DynamoMultimodalEmbeddingCacheConnector(ECConnectorBase):
         # if the consumer is wedged.
         self._event_buf_max = 2048
         self._event_buf: list[dict] = []
-        self._engine_id = getattr(transfer_config, "engine_id", "") or ""
+        # Robust against unit tests that pass a MagicMock for transfer_config.
+        _eid = getattr(transfer_config, "engine_id", "")
+        self._engine_id = _eid if isinstance(_eid, str) else ""
         # Write an initial all-zeros snapshot so the consumer never sees the
         # file as missing right after startup.
         self._flush_stats_snapshot()
