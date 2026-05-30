@@ -224,6 +224,22 @@ async def parse_args(args: list[str]) -> Config:
         config_merger = ConfigArgumentMerger(parser=sglang_only_parser)
         unknown = config_merger.merge_config_with_args(unknown)
 
+    # Normalize CLI flag aliases before SGLang argparse:
+    # SGLang ServerArgs.add_cli_args registers --tp-size only; users (and the
+    # vLLM backend) expect --tp as a short alias. Rewrite --tp -> --tp-size so
+    # parsed_args.tp_size reflects the CLI value (was silently 1 before).
+    def _alias_tp(args_list):
+        out = []
+        for a in args_list:
+            if a == "--tp":
+                out.append("--tp-size")
+            elif a.startswith("--tp="):
+                out.append("--tp-size=" + a[len("--tp="):])
+            else:
+                out.append(a)
+        return out
+    unknown = _alias_tp(unknown)
+
     parsed_args = sglang_only_parser.parse_args(unknown)
 
     # Clean up temp file if created
