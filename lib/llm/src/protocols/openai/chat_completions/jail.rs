@@ -1102,7 +1102,7 @@ impl JailedStream {
                             .enumerate()
                             .map(|(idx, tool_call)| ChatCompletionMessageToolCallChunk {
                                 index: (tool_call_offset + idx) as u32,
-                                id: Some(tool_call.id),
+                                id: Some(format!("call-{}", Uuid::new_v4())),
                                 r#type: Some(FunctionType::Function),
                                 function: Some(FunctionCallStream {
                                     name: Some(tool_call.function.name),
@@ -1288,8 +1288,11 @@ impl JailedStream {
                 // Assign final indices: renumber survivors 0..n (no gaps from
                 // the filter) then add the cumulative offset for consistency
                 // with the MarkerBased branch across multi-emission streams.
+                // Also rewrite the id so parser-local 'call-1' duplicates
+                // from incremental per-call invocations don't reach the client.
                 for (new_idx, chunk) in tool_call_chunks.iter_mut().enumerate() {
                     chunk.index = (tool_call_offset + new_idx) as u32;
+                    chunk.id = Some(format!("call-{}", Uuid::new_v4()));
                 }
 
                 if !tool_call_chunks.is_empty() {
