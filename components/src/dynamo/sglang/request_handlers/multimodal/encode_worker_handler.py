@@ -65,8 +65,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
     and forwards to the PD worker.
     """
 
-    _missing_video_cache_key_config_warned = False
-
     def __init__(
         self,
         config: Config,
@@ -76,6 +74,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         super().__init__(engine=None, config=config, shutdown_event=shutdown_event)
         self.pd_worker_client = pd_worker_client
         self.model = config.server_args.model_path
+        self._missing_video_cache_key_config_warned = False
 
         if MMEncoder is None:
             raise RuntimeError(
@@ -145,7 +144,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         if isinstance(value, dict):
             return {
                 str(key): cls._normalize_cache_key_value(nested_value)
-                for key, nested_value in sorted(value.items())
+                for key, nested_value in value.items()
             }
         if isinstance(value, (list, tuple)):
             return [cls._normalize_cache_key_value(item) for item in value]
@@ -155,45 +154,36 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             return value
         return str(value)
 
-    @classmethod
-    def _media_cache_key(cls, url: str, modality: Any, encoder: Any) -> str:
+    def _media_cache_key(self, url: str, modality: Any, encoder: Any) -> str:
         """Build a cache key that is URL-stable for images and config-aware for video."""
         if modality != Modality.VIDEO:
-            return cls._url_hash(url)
+            return self._url_hash(url)
 
         video_config = {}
         missing_config_fields: list[str] = []
         vision_config = getattr(encoder, "vision_config", None)
         if isinstance(vision_config, dict):
-            video_config = cls._normalize_cache_key_value(
+            video_config = self._normalize_cache_key_value(
                 vision_config.get("video", {})
             )
         else:
             missing_config_fields.append("vision_config")
 
-        video_processor = getattr(encoder, "video_processor", None)
-        if video_processor is None:
-            missing_config_fields.append("video_processor")
-        if missing_config_fields and not cls._missing_video_cache_key_config_warned:
+        if missing_config_fields and not getattr(
+            self, "_missing_video_cache_key_config_warned", False
+        ):
             logger.warning(
                 "Video embedding cache key could not include encoder %s; "
                 "cache reuse may not reflect all video processor settings.",
                 ", ".join(missing_config_fields),
             )
-            cls._missing_video_cache_key_config_warned = True
+            self._missing_video_cache_key_config_warned = True
 
         cache_key_payload = {
-            "modality": getattr(modality, "name", str(modality)),
             "url": url,
-            "model_type": cls._normalize_cache_key_value(
-                getattr(encoder, "model_type", None)
-            ),
-            "temporal_patch_size": cls._normalize_cache_key_value(
-                getattr(video_processor, "temporal_patch_size", None)
-            ),
             "video_config": video_config,
         }
-        return cls._url_hash(
+        return self._url_hash(
             json.dumps(cache_key_payload, sort_keys=True, separators=(",", ":"))
         )
 
@@ -236,6 +226,8 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             and len(grid_list) == 3
             and not isinstance(grid_list[0], list)
         ):
+            # SGLang may squeeze the batch dimension for a single media item.
+            # Normalize that flat THW grid to the batched shape used below.
             return [grid_list]
         return grid_list
 
@@ -332,7 +324,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         for i, (url, cache_key) in enumerate(zip(media_urls, cache_keys)):
             hit = self._embedding_cache.get(cache_key)
             if hit is not None:
-                logger.debug("Embedding cache hit for URL index %d", i)
+                logger.info("Embedding cache hit for %s URL index %d", modality_name, i)
                 cached[i] = hit
             else:
                 uncached_indices.append(i)
@@ -579,8 +571,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
 
                 if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 2:
                     raise ValueError(
-                        "Unsupported embeddings type from encoder: "
-                        f"{type(embeddings)}"
+                        f"Unsupported embeddings type from encoder: {type(embeddings)}"
                     )
 
                 token_counts = self._split_token_counts(
