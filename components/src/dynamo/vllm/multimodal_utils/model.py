@@ -61,6 +61,7 @@ _FAMILY_ARCHITECTURES: Dict[ModelFamily, frozenset[str]] = {
             # config inspection — pending empirical verification against a
             # deployed Qwen3.5 model.
             "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
         }
     ),
     ModelFamily.LLAVA: frozenset({"LlavaForConditionalGeneration"}),
@@ -81,6 +82,7 @@ _FAMILY_NAME_PATTERNS: Dict[ModelFamily, frozenset[str]] = {
             # QWEN_VL via the subclass relationship documented in
             # _FAMILY_ARCHITECTURES.
             "qwen3.5",
+            "qwen3.6",
         }
     ),
     ModelFamily.LLAVA: frozenset({"llava-1.5-7b-hf"}),
@@ -155,7 +157,11 @@ def resolve_model_family(model_name: str) -> Optional[ModelFamily]:
     return None
 
 
-def load_vision_model(model_id: str, enforce_eager: bool = False) -> torch.nn.Module:
+def load_vision_model(
+    model_id: str,
+    enforce_eager: bool = False,
+    gpu_memory_utilization: float = 0.2,
+) -> torch.nn.Module:
     """
     Load a vision model from a HuggingFace model ID.
     """
@@ -175,10 +181,10 @@ def load_vision_model(model_id: str, enforce_eager: bool = False) -> torch.nn.Mo
             enforce_eager=enforce_eager,
             # vLLM's free-memory precheck runs before kv_cache_memory_bytes applies;
             # default 0.9 fails on <=24 GiB GPUs when another worker shares the device.
-            gpu_memory_utilization=0.2,
+            gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=1024
             * 1024
-            * 64,  # 64MB KV cache for vLLM to complete the init lifecycle, encoder-only doesn't require KV cache.
+            * 256,  # Minimal KV cache for vLLM init; encoder-only does not use it.
             max_model_len=1,
             mm_encoder_only=True,
             enable_prefix_caching=False,

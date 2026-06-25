@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import functools
 import logging
 import os
 import time
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -46,6 +48,14 @@ CACHE_SIZE_MAXIMUM = 8
 ENABLE_ENCODER_CACHE = int(os.getenv("ENABLE_ENCODER_CACHE", 1))
 
 
+async def _run_blocking(
+    executor: Executor | None, fn, *args, **kwargs
+):
+    loop = asyncio.get_running_loop()
+    call = functools.partial(fn, *args, **kwargs)
+    return await loop.run_in_executor(executor, call)
+
+
 @dataclass
 class EmbeddingItem:
     key: str
@@ -61,13 +71,18 @@ class EncodeWorkerHandler:
     ) -> None:
         self.engine_args = engine_args
         self.model = self.engine_args.model
+        torch_num_threads = os.getenv("DYN_EWORKER_TORCH_NUM_THREADS")
+        if torch_num_threads:
+            torch.set_num_threads(int(torch_num_threads))
 
         self.image_loader = ImageLoader(cache_size=CACHE_SIZE_MAXIMUM)
         self.image_processor = AutoImageProcessor.from_pretrained(
             self.model, trust_remote_code=True
         )
         self.vision_model = load_vision_model(
-            self.model, enforce_eager=self.engine_args.enforce_eager
+            self.model,
+            enforce_eager=self.engine_args.enforce_eager,
+            gpu_memory_utilization=self.engine_args.gpu_memory_utilization,
         )
         hidden_size = getattr(self.vision_model, "out_hidden_size", None)
         if hidden_size is None:
@@ -86,6 +101,12 @@ class EncodeWorkerHandler:
         self._processed_requests = 0
         self.readables: list[Any] = []
         self.embedding_cache = EmbeddingCache() if ENABLE_ENCODER_CACHE else None
+        executor_workers = os.getenv("DYN_EWORKER_EXECUTOR_WORKERS")
+        self._encode_executor = (
+            ThreadPoolExecutor(max_workers=int(executor_workers))
+            if executor_workers
+            else None
+        )
         self.embedding_sender: AbstractEmbeddingSender
         if embedding_transfer_mode == EmbeddingTransferMode.LOCAL:
             self.embedding_sender = LocalEmbeddingSender()
@@ -116,6 +137,8 @@ class EncodeWorkerHandler:
         self.send_complete_queue.put_nowait(
             (None, None)
         )  # Send sentinel value to stop the checker
+        if self._encode_executor is not None:
+            self._encode_executor.shutdown(wait=False, cancel_futures=True)
 
     async def async_init(self, runtime: DistributedRuntime):
         """Initialize the connector for RDMA transfers"""
@@ -226,8 +249,11 @@ class EncodeWorkerHandler:
                 ), time_and_log_code_section(
                     f"[ENCODE] request: {request_id} image processing"
                 ):
-                    image_embeds = await asyncio.to_thread(
-                        self.image_processor, images=loaded_images, return_tensors="pt"
+                    image_embeds = await _run_blocking(
+                        self._encode_executor,
+                        self.image_processor,
+                        images=loaded_images,
+                        return_tensors="pt",
                     )
 
                 with _nvtx.annotate(
@@ -236,7 +262,8 @@ class EncodeWorkerHandler:
                     f"[ENCODE] request: {request_id} encoding"
                 ):
                     # Encode the image embeddings using model-specific encoder
-                    embeddings = await asyncio.to_thread(
+                    embeddings = await _run_blocking(
+                        self._encode_executor,
                         encode_image_embeddings,
                         model_name=self.model,
                         image_embeds=image_embeds,
