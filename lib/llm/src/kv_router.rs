@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -46,6 +50,7 @@ pub use dynamo_kv_router::selector;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
+pub mod multimodal_epd_router;
 pub mod prefill_router;
 pub mod publisher;
 pub mod push_router;
@@ -59,6 +64,7 @@ pub use dynamo_kv_router::scheduling::{
 };
 pub use encoder_router::EncoderRouter;
 pub use indexer::{Indexer, ServedIndexerHandle, ServedIndexerMode, ensure_served_indexer_service};
+pub use multimodal_epd_router::MultimodalEpdRouter;
 pub use prefill_router::PrefillRouter;
 pub use push_router::{DirectRoutingRouter, KvPushRouter};
 
@@ -919,6 +925,15 @@ where
     /// Sum of ISL tokens for requests currently parked in the scheduler queue.
     pub fn pending_isl_tokens(&self) -> usize {
         self.scheduler.pending_isl_tokens()
+    }
+
+    pub fn get_scheduler_potential_loads(
+        &self,
+        isl_tokens: usize,
+        effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+    ) -> Vec<PotentialLoad> {
+        self.scheduler
+            .get_potential_loads(None, isl_tokens, effective_cached_tokens, true)
     }
 
     fn prefill_load_hint_for(

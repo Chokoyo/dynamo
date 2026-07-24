@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -48,6 +48,9 @@ class PreprocessedRequest(BaseModel):
     eos_token_ids: List[TokenIdType] = Field(default_factory=list)
     mdc_sum: Optional[str] = None
     annotations: List[str] = Field(default_factory=list)
+    multi_modal_data: Optional[Dict[str, List[Any]]] = None
+    multi_modal_uuids: Optional[Dict[str, List[Optional[str]]]] = None
+    mm_routing_info: Optional[Dict[str, Any]] = None
 
 
 EmbeddingInput = Union[str, List[str], List[int], List[List[int]]]
@@ -57,9 +60,9 @@ class EmbeddingRequest(BaseModel):
     model: str
     input: EmbeddingInput
     user: Optional[str] = None
-    dimensions: Optional[
-        int
-    ] = None  # only supported in text-embedding-3 and later models from OpenAI
+    dimensions: Optional[int] = (
+        None  # only supported in text-embedding-3 and later models from OpenAI
+    )
     encoding_format: Literal["float", "base64"] = "float"
 
 
@@ -148,6 +151,37 @@ class DisaggSglangMultimodalRequest(BaseModel):
     request: SglangMultimodalRequest
     sampling_params: dict
     data_parallel_rank: Optional[int] = None
+
+
+class SglangEpdMediaObject(BaseModel):
+    object_index: int
+    modality: Literal["IMAGE", "VIDEO"]
+    url: Optional[str] = None
+    expected_cache_key: Optional[str] = None
+
+
+class SglangEpdObjectRequest(BaseModel):
+    request_type: Literal["sglang_epd_object_request"] = "sglang_epd_object_request"
+    version: Literal[1] = 1
+    objects: List[SglangEpdMediaObject]
+
+
+class SglangEpdObjectPart(BaseModel):
+    object_index: int
+    modality: Literal["IMAGE", "VIDEO"]
+    cache_key: str
+    embeddings_shape: Tuple[int, int]
+    transfer_payload: TransferRequest
+    grid_thw: List[Any]
+    num_mm_tokens: int
+    second_per_grid_ts: Optional[float] = None
+    video_timestamps: Optional[SingleVideoTimestamps] = None
+
+
+class SglangEpdObjectResponse(BaseModel):
+    response_type: Literal["sglang_epd_object_response"] = "sglang_epd_object_response"
+    version: Literal[1] = 1
+    parts: List[SglangEpdObjectPart]
 
 
 # ============================================================================

@@ -90,6 +90,17 @@ class TestMultimodalEmbeddingCacheManagerBasicOperations:
         assert m3.added_keys == ["key3"]
         assert m3.removed_keys == ["key1"]
 
+    def test_clear_with_delta_reports_all_resident_keys(self):
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024)
+        cache.set("key1", CachedEmbedding(torch.randn(10, 10)))
+        cache.set("key2", CachedEmbedding(torch.randn(10, 10)))
+
+        mutation = cache.clear_with_delta()
+
+        assert mutation == CacheMutation(True, [], ["key1", "key2"])
+        assert cache.keys() == []
+        assert cache.stats["current_bytes"] == 0
+
 
 class TestMultimodalEmbeddingCacheManagerLRUEviction:
     """Tests for LRU eviction behavior."""

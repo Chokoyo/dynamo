@@ -260,6 +260,16 @@ impl MultimodalCacheIndex for EmbeddingCacheIndexer {
         self.worker_cache_key_hits(cache_keys.iter().map(|key| key.as_str()))
     }
 
+    fn workers_for_cache_key(&self, cache_key: &str) -> Vec<WorkerId> {
+        let mut workers = self
+            .key_workers
+            .get(cache_key)
+            .map(|workers| workers.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        workers.sort_unstable();
+        workers
+    }
+
     fn remove_worker(&self, worker_id: WorkerId) {
         EmbeddingCacheIndexer::remove_worker(self, worker_id);
     }
@@ -271,6 +281,7 @@ mod tests {
     use crate::kv_router::publisher::{
         MultimodalEmbeddingCacheEvent, MultimodalEmbeddingCacheUpdate,
     };
+    use dynamo_runtime::pipeline::MultimodalCacheIndex;
 
     #[test]
     fn delta_removes_stale_worker_keys() {
@@ -294,6 +305,23 @@ mod tests {
         let worker_keys = indexer.worker_cache_keys.get(&7).unwrap();
         assert_eq!(worker_keys.len(), 1);
         assert!(worker_keys.contains("c"));
+    }
+
+    #[test]
+    fn per_key_lookup_is_sorted() {
+        let indexer = EmbeddingCacheIndexer::default();
+        for worker_id in [9, 3] {
+            indexer.apply_event(&MultimodalEmbeddingCacheEvent {
+                worker_id,
+                update: MultimodalEmbeddingCacheUpdate {
+                    added_keys: vec!["shared".to_string()],
+                    removed_keys: vec![],
+                },
+            });
+        }
+
+        assert_eq!(indexer.workers_for_cache_key("shared"), vec![3, 9]);
+        assert!(indexer.workers_for_cache_key("missing").is_empty());
     }
 
     #[test]

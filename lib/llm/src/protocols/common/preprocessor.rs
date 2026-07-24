@@ -144,6 +144,30 @@ pub struct MmRoutingInfo {
     /// (which includes block-padding) when a real token count is needed.
     #[serde(default)]
     pub expanded_prompt_len: usize,
+
+    /// Advisory or enforced target-P decision computed before Encode dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epd_prefill_selection: Option<MmEpdPrefillSelection>,
+
+    /// Joint KV/EC object-source plan consumed by backend P coordinators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epd_routing_plan: Option<super::multimodal_epd::MmRoutingPlan>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MmEpdRoutingMode {
+    Off,
+    Observe,
+    Enforce,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MmEpdPrefillSelection {
+    pub mode: MmEpdRoutingMode,
+    pub worker_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dp_rank: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

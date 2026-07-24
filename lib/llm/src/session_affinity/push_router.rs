@@ -27,6 +27,10 @@ pub struct SessionAffinityPushRouter {
 }
 
 impl SessionAffinityPushRouter {
+    pub(crate) fn client(&self) -> &dynamo_runtime::component::Client {
+        &self.inner.client
+    }
+
     pub fn new(
         inner: PushRouter<PreprocessedRequest, LlmResponse>,
         ttl: Option<Duration>,

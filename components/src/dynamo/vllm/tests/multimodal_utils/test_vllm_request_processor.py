@@ -117,6 +117,118 @@ async def test_merges_encoder_images_with_local_video_and_decoded_fallback():
 
 
 @pytest.mark.asyncio
+async def test_forwards_enforced_epd_object_plan_to_embedding_loader():
+    processor = _processor()
+    processor.embedding_loader = SimpleNamespace(
+        load_multimodal_embeddings=AsyncMock(return_value={"image": object()})
+    )
+    routing_plan = {
+        "target_p_worker_id": 3,
+        "target_p_generation": 1,
+        "objects": [],
+    }
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {
+                "image_url": [{"Url": "https://example.com/image.png"}]
+            },
+            "mm_routing_info": {
+                "epd_prefill_selection": {"mode": "enforce", "worker_id": 3},
+                "epd_routing_plan": routing_plan,
+            },
+        },
+        "request-enforce",
+        None,
+    )
+
+    assert (
+        processor.embedding_loader.load_multimodal_embeddings.await_args.kwargs[
+            "routing_plan"
+        ]
+        is routing_plan
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforced_epd_registers_post_kv_fetch_when_hashes_are_available():
+    processor = _processor()
+    processor.embedding_loader = SimpleNamespace(
+        load_multimodal_embeddings=AsyncMock(return_value={"image": object()})
+    )
+    processor.epd_embedding_bridge = SimpleNamespace(register=AsyncMock())
+    image = Image.new("RGB", (1, 1))
+    processor.image_loader.load_image_batch.return_value = [image]
+    routing_plan = {
+        "target_p_worker_id": 3,
+        "target_p_generation": 1,
+        "objects": [
+            {
+                "object_index": 0,
+                "source_kind": "E_COMPUTE",
+                "source_worker_id": 7,
+                "source_worker_generation": 1,
+            }
+        ],
+    }
+
+    result = await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {
+                "image_url": [{"Url": "https://example.com/image.png"}]
+            },
+            "extra_args": {"mm_hashes": ["abc"]},
+            "mm_routing_info": {
+                "epd_prefill_selection": {"mode": "enforce", "worker_id": 3},
+                "epd_routing_plan": routing_plan,
+            },
+        },
+        "request-post-kv",
+        None,
+    )
+
+    assert result == {"image": image}
+    processor.embedding_loader.load_multimodal_embeddings.assert_not_awaited()
+    processor.epd_embedding_bridge.register.assert_awaited_once_with(
+        request_id="request-post-kv",
+        image_urls=["https://example.com/image.png"],
+        identifiers=["abc".ljust(64, "0")],
+        model=processor.model,
+        routing_plan=routing_plan,
+        context=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_does_not_enforce_epd_object_plan():
+    processor = _processor()
+    processor.embedding_loader = SimpleNamespace(
+        load_multimodal_embeddings=AsyncMock(return_value={"image": object()})
+    )
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {
+                "image_url": [{"Url": "https://example.com/image.png"}]
+            },
+            "mm_routing_info": {
+                "epd_prefill_selection": {"mode": "observe", "worker_id": 3},
+                "epd_routing_plan": {"objects": []},
+            },
+        },
+        "request-observe",
+        None,
+    )
+
+    assert (
+        processor.embedding_loader.load_multimodal_embeddings.await_args.kwargs[
+            "routing_plan"
+        ]
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_extracts_uuid_only_media_as_aligned_none_slots():
     processor = _processor()
     image = Image.new("RGB", (1, 1))

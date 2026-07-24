@@ -33,6 +33,9 @@ from dynamo.sglang.protocol import (
     MultiModalGroup,
     MultiModalInput,
     PreprocessedRequest,
+    SglangEpdObjectPart,
+    SglangEpdObjectRequest,
+    SglangEpdObjectResponse,
     SglangMultimodalRequest,
 )
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
@@ -490,6 +493,114 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
 
         return image_urls, video_urls
 
+    async def _encode_epd_object(
+        self, media_object, modality: Any
+    ) -> tuple[SglangEpdObjectPart, Any]:
+        if media_object.url is None:
+            if self._embedding_cache is None or media_object.expected_cache_key is None:
+                raise RuntimeError(
+                    f"UUID-only object {media_object.object_index} has no cache source"
+                )
+            entry = self._embedding_cache.get(media_object.expected_cache_key)
+            if entry is None:
+                raise RuntimeError(
+                    f"UUID-only object {media_object.object_index} cache entry disappeared"
+                )
+            cache_key = media_object.expected_cache_key
+        elif self._embedding_cache is not None:
+            _, _, entries = await self._encode_with_cache([media_object.url], modality)
+            entry = entries[0]
+            cache_key = self._media_cache_key(media_object.url, modality, self.encoder)
+        else:
+            grid_dim, embeddings, aux_data = await self.encoder._encode(
+                [media_object.url], modality
+            )
+            grid_list = self._ensure_batched_grid(grid_dim, 1)
+            if not isinstance(grid_list, list) or len(grid_list) != 1:
+                raise ValueError(f"invalid object grid metadata: {grid_list!r}")
+            if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 2:
+                raise ValueError(
+                    f"unsupported embeddings type from encoder: {type(embeddings)}"
+                )
+            entry_kwargs: dict[str, Any] = {"tensor": embeddings.contiguous()}
+            modality_name = getattr(modality, "name", str(modality))
+            if modality_name == "IMAGE":
+                entry_kwargs["image_grid_thw"] = grid_list[0]
+            elif modality_name == "VIDEO":
+                entry_kwargs["video_grid_thw"] = grid_list[0]
+                if aux_data:
+                    entry_kwargs["second_per_grid_ts"] = self._aux_value_for_item(
+                        aux_data.get("second_per_grid_ts"), 0, 1
+                    )
+                    entry_kwargs["video_timestamps"] = self._aux_value_for_item(
+                        aux_data.get("video_timestamps"), 0, 1
+                    )
+            else:
+                raise ValueError(f"unsupported multimodal modality: {modality}")
+            entry = CachedEmbedding(**entry_kwargs)
+            cache_key = self._media_cache_key(media_object.url, modality, self.encoder)
+        if (
+            media_object.expected_cache_key is not None
+            and media_object.expected_cache_key != cache_key
+        ):
+            raise ValueError(
+                f"cache key mismatch for object {media_object.object_index}: "
+                f"expected {media_object.expected_cache_key}, got {cache_key}"
+            )
+
+        transfer_request, transfer_future = await self.embedding_sender.send_embeddings(
+            entry.tensor
+        )
+        modality_name = getattr(modality, "name", str(modality))
+        grid_thw = (
+            entry.image_grid_thw if modality_name == "IMAGE" else entry.video_grid_thw
+        )
+        if grid_thw is None:
+            raise ValueError("encoded object is missing grid metadata")
+        return (
+            SglangEpdObjectPart(
+                object_index=media_object.object_index,
+                modality=media_object.modality,
+                cache_key=cache_key,
+                embeddings_shape=tuple(entry.tensor.shape),
+                transfer_payload=transfer_request,
+                grid_thw=grid_thw,
+                num_mm_tokens=int(entry.tensor.shape[0]),
+                second_per_grid_ts=entry.second_per_grid_ts,
+                video_timestamps=entry.video_timestamps,
+            ),
+            transfer_future,
+        )
+
+    async def _generate_epd_objects(
+        self, raw_request: Dict[str, Any]
+    ) -> AsyncIterator[Dict[str, Any]]:
+        request = SglangEpdObjectRequest.model_validate(raw_request)
+        if not request.objects:
+            raise ValueError(
+                "object-level EPD request must contain at least one object"
+            )
+        logger.info(
+            "SGLang EPD encode worker processing object indices %s",
+            [media_object.object_index for media_object in request.objects],
+        )
+
+        results = []
+        for media_object in request.objects:
+            results.append(
+                await self._encode_epd_object(
+                    media_object,
+                    Modality.IMAGE
+                    if media_object.modality == "IMAGE"
+                    else Modality.VIDEO,
+                )
+            )
+        parts = [part for part, _ in results]
+        transfer_futures = [future for _, future in results if future is not None]
+        yield SglangEpdObjectResponse(parts=parts).model_dump(mode="json")
+        if transfer_futures:
+            await asyncio.gather(*transfer_futures)
+
     @_nvtx.range_decorator("mm:enc:generate", color="blue")
     async def generate(
         self, raw_request: Dict[str, Any], context: Context
@@ -512,6 +623,11 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         """
         if isinstance(raw_request, str):
             raw_request = json.loads(raw_request)
+
+        if raw_request.get("request_type") == "sglang_epd_object_request":
+            async for response in self._generate_epd_objects(raw_request):
+                yield response
+            return
 
         # Extract image/video URLs from the frontend's multi_modal_data
         image_urls, video_urls = self._extract_media_urls(raw_request)

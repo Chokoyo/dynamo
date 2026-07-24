@@ -15,15 +15,18 @@ use dynamo_runtime::{
     component::Endpoint,
     engine::AsyncEngine,
     pipeline::{
-        Context, ManyOut, Operator, PushRouter, RouterMode, ServerStreamingEngine, SingleIn,
-        async_trait,
+        Context, ManyOut, MultimodalCacheIndex, Operator, PushRouter, RouterMode,
+        ServerStreamingEngine, SingleIn, async_trait,
     },
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 
+use crate::kv_router::{
+    indexer::try_build_cache_indexer, multimodal_epd_router::cache_index_enabled_from_env,
+};
 use crate::protocols::common::{
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
-    preprocessor::TraceLink,
+    preprocessor::{MmEpdRoutingMode, TraceLink},
 };
 
 type EncodePushRouter = PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>;
@@ -55,6 +58,7 @@ impl EncoderLifecycleState {
 /// token router mode; they do not participate in KV-aware routing.
 pub struct EncoderRouter {
     router: OnceLock<Arc<EncodePushRouter>>,
+    embedding_cache_index: OnceLock<Arc<dyn MultimodalCacheIndex>>,
     cancel_token: CancellationToken,
     lifecycle: AtomicU8,
     model_name: String,
@@ -72,6 +76,7 @@ impl EncoderRouter {
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             router: OnceLock::new(),
+            embedding_cache_index: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             lifecycle: AtomicU8::new(EncoderLifecycleState::Pending as u8),
             model_name: String::new(),
@@ -88,6 +93,7 @@ impl EncoderRouter {
         let cancel_token = CancellationToken::new();
         let router = Arc::new(Self {
             router: OnceLock::new(),
+            embedding_cache_index: OnceLock::new(),
             cancel_token: cancel_token.clone(),
             lifecycle: AtomicU8::new(EncoderLifecycleState::Pending as u8),
             model_name,
@@ -120,6 +126,11 @@ impl EncoderRouter {
     }
 
     async fn activate(&self, endpoint: Endpoint) -> Result<()> {
+        if cache_index_enabled_from_env()
+            && let Some(index) = try_build_cache_indexer(&endpoint).await
+        {
+            let _ = self.embedding_cache_index.set(index);
+        }
         let client = endpoint.client().await?;
         let router =
             EncodePushRouter::from_client_with_monitor(client, RouterMode::RoundRobin, None)
@@ -175,13 +186,66 @@ impl EncoderRouter {
         self.lifecycle_state() == EncoderLifecycleState::Unavailable
     }
 
+    pub fn live_worker_ids(&self) -> Vec<u64> {
+        let mut workers = self
+            .router
+            .get()
+            .map(|router| router.client.instance_ids_avail())
+            .unwrap_or_default();
+        workers.sort_unstable();
+        workers
+    }
+
+    pub fn live_workers_for_cache_key(&self, cache_key: &str) -> Vec<u64> {
+        let live_workers = self.live_worker_ids();
+        self.embedding_cache_index
+            .get()
+            .map(|index| {
+                index
+                    .workers_for_cache_key(cache_key)
+                    .into_iter()
+                    .filter(|worker_id| live_workers.binary_search(worker_id).is_ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn should_encode(request: &PreprocessedRequest) -> bool {
         !request.is_probe
             && request.encoder_result.is_none()
+            && !Self::has_complete_enforced_plan(request)
             && request
                 .multi_modal_data
                 .as_ref()
                 .is_some_and(|media| media.values().any(|items| !items.is_empty()))
+    }
+
+    fn has_complete_enforced_plan(request: &PreprocessedRequest) -> bool {
+        let Some(routing_info) = request.mm_routing_info.as_ref() else {
+            return false;
+        };
+        if !routing_info
+            .epd_prefill_selection
+            .as_ref()
+            .is_some_and(|selection| selection.mode == MmEpdRoutingMode::Enforce)
+        {
+            return false;
+        }
+        let Some(plan) = routing_info.epd_routing_plan.as_ref() else {
+            return false;
+        };
+        let media_count = request
+            .multi_modal_data
+            .as_ref()
+            .map(|media| media.values().map(Vec::len).sum::<usize>())
+            .unwrap_or_default();
+        media_count > 0
+            && plan.objects.len() == media_count
+            && plan
+                .objects
+                .iter()
+                .enumerate()
+                .all(|(index, object)| object.object_index == index)
     }
 
     async fn consume_encode_stream(
@@ -277,7 +341,10 @@ mod tests {
         pipeline::{Error, ResponseStream, context::Controller},
     };
 
-    use crate::protocols::common::preprocessor::MultimodalData;
+    use crate::protocols::common::multimodal_epd::{MmObjectPlan, MmRoutingPlan, MmSourceKind};
+    use crate::protocols::common::preprocessor::{
+        MmEpdPrefillSelection, MmRoutingInfo, MultimodalData,
+    };
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 
     use super::*;
@@ -328,6 +395,61 @@ mod tests {
             .output_options(OutputOptions::default())
             .build()
             .unwrap()
+    }
+
+    fn with_epd_plan(
+        mut request: PreprocessedRequest,
+        mode: MmEpdRoutingMode,
+    ) -> PreprocessedRequest {
+        request.mm_routing_info = Some(MmRoutingInfo {
+            epd_prefill_selection: Some(MmEpdPrefillSelection {
+                mode,
+                worker_id: 9,
+                dp_rank: None,
+            }),
+            epd_routing_plan: Some(MmRoutingPlan {
+                target_p_worker_id: 9,
+                target_p_generation: 9,
+                objects: vec![MmObjectPlan {
+                    object_index: 0,
+                    source_kind: MmSourceKind::ECompute,
+                    source_worker_id: 7,
+                    source_worker_generation: 7,
+                    estimated_cost_ms: 1.0,
+                }],
+                predicted_benefit_ms: 1.0,
+                score_components: Default::default(),
+            }),
+            ..Default::default()
+        });
+        request
+    }
+
+    #[test]
+    fn complete_enforced_plan_bypasses_request_level_encoder() {
+        let request = with_epd_plan(multimodal_request(), MmEpdRoutingMode::Enforce);
+        assert!(!EncoderRouter::should_encode(&request));
+    }
+
+    #[test]
+    fn observe_plan_keeps_legacy_request_level_encoder() {
+        let request = with_epd_plan(multimodal_request(), MmEpdRoutingMode::Observe);
+        assert!(EncoderRouter::should_encode(&request));
+    }
+
+    #[test]
+    fn incomplete_enforced_plan_keeps_legacy_request_level_encoder() {
+        let mut request = with_epd_plan(multimodal_request(), MmEpdRoutingMode::Enforce);
+        request
+            .mm_routing_info
+            .as_mut()
+            .unwrap()
+            .epd_routing_plan
+            .as_mut()
+            .unwrap()
+            .objects
+            .clear();
+        assert!(EncoderRouter::should_encode(&request));
     }
 
     #[tokio::test]

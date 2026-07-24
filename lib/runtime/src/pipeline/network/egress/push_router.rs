@@ -123,6 +123,7 @@ pub trait WorkerLoadMonitor: Send + Sync {
 /// Query interface for routing against multimodal embedding cache state.
 pub trait MultimodalCacheIndex: Send + Sync {
     fn workers_with_cache_key_hits(&self, cache_keys: &[String]) -> Vec<(u64, usize)>;
+    fn workers_for_cache_key(&self, cache_key: &str) -> Vec<u64>;
     fn remove_worker(&self, worker_id: u64);
 }
 
@@ -1764,6 +1765,10 @@ mod tests {
     impl MultimodalCacheIndex for StaticMultimodalCacheIndex {
         fn workers_with_cache_key_hits(&self, cache_keys: &[String]) -> Vec<(u64, usize)> {
             vec![(self.worker_id, cache_keys.len())]
+        }
+
+        fn workers_for_cache_key(&self, _cache_key: &str) -> Vec<u64> {
+            vec![self.worker_id]
         }
 
         fn remove_worker(&self, _worker_id: u64) {}

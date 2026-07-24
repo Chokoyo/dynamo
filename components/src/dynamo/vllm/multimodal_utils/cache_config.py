@@ -4,6 +4,8 @@
 """Lightweight vLLM multimodal embedding-cache startup configuration."""
 
 import logging
+import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +20,26 @@ def configure_multimodal_embedding_cache(
 ) -> None:
     """Configure vLLM's CPU embedding cache before engine creation.
 
-    Separate encode-worker deployments use Dynamo's worker-layer cache. All
-    other vLLM deployments use the EC connector owned by vLLM. The vLLM config
-    import stays lazy so cache-disabled workers do not load EC-transfer code.
+    The connector is also enabled with separate encode workers so its
+    ``ensure_cache_available`` hook can request only multimodal items not
+    covered by authoritative KV state.
     """
-    if route_to_encoder or capacity_gb <= 0:
+    if capacity_gb <= 0:
         return
 
     from vllm.config import ECTransferConfig
 
     engine_id = f"{namespace}.{component}.backend.0"
+    bridge_dir = os.environ.get("DYN_VLLM_EPD_BRIDGE_DIR")
+    if not bridge_dir:
+        bridge_dir = os.path.join(
+            tempfile.gettempdir(),
+            f"dynamo-vllm-epd-{os.getpid()}-{namespace}-{component}",
+        )
+        # vLLM may initialize the EC connector in a spawned EngineCore process.
+        # Persist the parent-selected directory so the child connector and the
+        # Dynamo request handler use the same filesystem bridge.
+        os.environ["DYN_VLLM_EPD_BRIDGE_DIR"] = bridge_dir
     setattr(
         engine_args,
         "ec_transfer_config",
@@ -40,6 +52,7 @@ def configure_multimodal_embedding_cache(
             ),
             ec_connector_extra_config={
                 "multimodal_embedding_cache_capacity_gb": capacity_gb,
+                "epd_bridge_dir": bridge_dir,
             },
         ),
     )

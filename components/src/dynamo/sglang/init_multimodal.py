@@ -217,7 +217,34 @@ async def init_multimodal_prefill_worker(
         f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
     )
 
-    handler = MultimodalPrefillWorkerHandler(engine, config, shutdown_event)
+    encode_worker_client = await runtime.endpoint(
+        f"{dynamo_args.namespace}.encode.generate"
+    ).client()
+    await encode_worker_client.wait_for_instances()
+
+    cache_publisher = None
+    if (
+        config.dynamo_args.multimodal_embedding_cache_capacity_gb > 0
+        and config.dynamo_args.multimodal_embedding_cache_publisher
+    ):
+        cache_publisher = MultimodalEmbeddingCachePublisher()
+        await cache_publisher.create_endpoint(generate_endpoint)
+
+    handler = MultimodalPrefillWorkerHandler(
+        engine,
+        config,
+        encode_worker_client,
+        cache_publisher,
+        shutdown_event,
+    )
+
+    if handler._embedding_cache is not None:
+        register_embedding_cache_metrics(
+            endpoint=generate_endpoint,
+            cache=handler._embedding_cache,
+            model_name=server_args.served_model_name,
+            component_name=dynamo_args.component,
+        )
 
     shutdown_endpoints[:] = [generate_endpoint]
 

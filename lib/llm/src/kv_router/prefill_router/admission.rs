@@ -9,6 +9,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument;
 
 use dynamo_runtime::{
+    component::Client,
     pipeline::{ManyOut, SingleIn},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
@@ -29,6 +30,13 @@ pub(super) enum InnerPrefillRouter {
 }
 
 impl InnerPrefillRouter {
+    pub(super) fn client(&self) -> &Client {
+        match self {
+            InnerPrefillRouter::KvRouter(router) => router.client(),
+            InnerPrefillRouter::SimpleRouter(router) => router.client(),
+        }
+    }
+
     pub(super) async fn select_and_dispatch_prefill<M, F>(
         &self,
         request: SingleIn<PreprocessedRequest>,

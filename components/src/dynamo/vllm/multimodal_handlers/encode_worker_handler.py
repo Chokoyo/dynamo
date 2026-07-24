@@ -21,17 +21,20 @@ from dynamo.common.multimodal import (
 from dynamo.common.multimodal.embedding_transfer import AbstractEmbeddingSender
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.time_section import time_and_log_code_section
+from dynamo.llm import MultimodalEmbeddingCachePublisher
 from dynamo.runtime import DistributedRuntime
 
 from ..constants import EmbeddingTransferMode
 from ..multimodal_utils import (
     ImageLoader,
+    MultiModalGroup,
     encode_image_embeddings,
     get_encoder_components,
     load_vision_model,
     vLLMMultimodalRequest,
 )
 from ..multimodal_utils.embedding_cache import EmbeddingCache
+from ..multimodal_utils.epd_embedding_bridge import write_epd_audit_event
 from ..multimodal_utils.model import ModelFamily, resolve_model_family
 
 logger = logging.getLogger(__name__)
@@ -53,11 +56,23 @@ class EmbeddingItem:
     embeddings: torch.Tensor
 
 
+def _attach_transfer_metadata(
+    group: MultiModalGroup,
+    embedding_item: EmbeddingItem,
+    serialized_request: Any,
+) -> None:
+    assert group.multimodal_input is not None
+    group.image_grid_thw = embedding_item.image_grid_thw
+    group.embeddings_shape = tuple(embedding_item.embeddings.shape)  # type: ignore[assignment]
+    group.serialized_request = serialized_request
+
+
 class EncodeWorkerHandler:
     def __init__(
         self,
         engine_args: AsyncEngineArgs,
         embedding_transfer_mode: EmbeddingTransferMode,
+        cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ) -> None:
         self.engine_args = engine_args
         self.model = self.engine_args.model
@@ -88,6 +103,7 @@ class EncodeWorkerHandler:
         self._processed_requests = 0
         self.readables: list[Any] = []
         self.embedding_cache = EmbeddingCache() if ENABLE_ENCODER_CACHE else None
+        self._cache_publisher = cache_publisher
         self.embedding_sender: AbstractEmbeddingSender
         if embedding_transfer_mode == EmbeddingTransferMode.LOCAL:
             self.embedding_sender = LocalEmbeddingSender()
@@ -115,9 +131,22 @@ class EncodeWorkerHandler:
             queue.task_done()
 
     def cleanup(self):
+        if self.embedding_cache is not None and self._cache_publisher is not None:
+            mutation = self.embedding_cache.clear_with_delta()
+            self._publish_cache_delta(mutation.added_keys, mutation.removed_keys)
         self.send_complete_queue.put_nowait(
             (None, None)
         )  # Send sentinel value to stop the checker
+
+    def _publish_cache_delta(
+        self, added_keys: list[str], removed_keys: list[str]
+    ) -> None:
+        if self._cache_publisher is None or (not added_keys and not removed_keys):
+            return
+        try:
+            self._cache_publisher.publish_delta(added_keys, removed_keys)
+        except Exception:
+            logger.warning("Failed to publish vLLM encode cache delta", exc_info=True)
 
     async def async_init(self, runtime: DistributedRuntime):
         """Initialize the connector for RDMA transfers"""
@@ -174,6 +203,18 @@ class EncodeWorkerHandler:
                         self.embedding_cache is not None
                         and self.embedding_cache.has_key(embedding_key)
                     ):
+                        logger.info(
+                            "vLLM EPD encode cache hit: request_id=%s index=%d key=%s",
+                            request_id,
+                            idx,
+                            embedding_key,
+                        )
+                        write_epd_audit_event(
+                            "ENCODE_CACHE_HIT",
+                            request_id=request_id,
+                            index=idx,
+                            cache_key=embedding_key,
+                        )
                         (image_grid_thw, embeddings) = self.embedding_cache.get(
                             embedding_key
                         )
@@ -182,13 +223,26 @@ class EncodeWorkerHandler:
                         )
                     # compute
                     else:
+                        logger.info(
+                            "vLLM EPD encode compute: request_id=%s index=%d key=%s",
+                            request_id,
+                            idx,
+                            embedding_key,
+                        )
+                        write_epd_audit_event(
+                            "ENCODE_COMPUTE",
+                            request_id=request_id,
+                            index=idx,
+                            cache_key=embedding_key,
+                        )
                         # keep track of key to avoid recompute of it
                         need_encode_indexes.append((idx, embedding_key))
 
-            with _nvtx.annotate(
-                "mm:enc:image_load", color="green"
-            ), time_and_log_code_section(
-                f"[ENCODE] request: {request_id} image loading"
+            with (
+                _nvtx.annotate("mm:enc:image_load", color="green"),
+                time_and_log_code_section(
+                    f"[ENCODE] request: {request_id} image loading"
+                ),
             ):
                 # Load and generate image tensors
                 image_tasks = []
@@ -222,19 +276,21 @@ class EncodeWorkerHandler:
                     )
 
             if loaded_images:
-                with _nvtx.annotate(
-                    "mm:enc:image_preprocess", color="yellow"
-                ), time_and_log_code_section(
-                    f"[ENCODE] request: {request_id} image processing"
+                with (
+                    _nvtx.annotate("mm:enc:image_preprocess", color="yellow"),
+                    time_and_log_code_section(
+                        f"[ENCODE] request: {request_id} image processing"
+                    ),
                 ):
                     image_embeds = await asyncio.to_thread(
                         self.image_processor, images=loaded_images, return_tensors="pt"
                     )
 
-                with _nvtx.annotate(
-                    "mm:enc:vision_encode", color="red"
-                ), time_and_log_code_section(
-                    f"[ENCODE] request: {request_id} encoding"
+                with (
+                    _nvtx.annotate("mm:enc:vision_encode", color="red"),
+                    time_and_log_code_section(
+                        f"[ENCODE] request: {request_id} encoding"
+                    ),
                 ):
                     # Encode the image embeddings using model-specific encoder
                     embeddings = await asyncio.to_thread(
@@ -284,12 +340,15 @@ class EncodeWorkerHandler:
                 )
                 # Cache the computed value for future use
                 if self.embedding_cache is not None:
-                    self.embedding_cache.set(
+                    mutation = self.embedding_cache.set_with_delta(
                         embedding_lists[list_idx].key,  # type: ignore
                         (
                             embedding_lists[list_idx].image_grid_thw,  # type: ignore
                             embedding_lists[list_idx].embeddings,  # type: ignore
                         ),
+                    )
+                    self._publish_cache_delta(
+                        mutation.added_keys, mutation.removed_keys
                     )
 
             before_transfer_time = time.perf_counter()
@@ -317,11 +376,9 @@ class EncodeWorkerHandler:
                     )
                     # Update request for transfer metadata
                     group = request.multimodal_inputs[idx]
-                    assert group.multimodal_input is not None
-                    group.multimodal_input.image_url = None
-                    group.image_grid_thw = embedding_item.image_grid_thw
-                    group.embeddings_shape = tuple(embedding_item.embeddings.shape)  # type: ignore[assignment]
-                    group.serialized_request = transfer_request[0]
+                    _attach_transfer_metadata(
+                        group, embedding_item, transfer_request[0]
+                    )
 
                     # Keep a reference of the embedding and only drop reference when the transfer is done
                     self.send_complete_queue.put_nowait(

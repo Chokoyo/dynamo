@@ -14,7 +14,8 @@ use crate::{
     http::service::metrics::Metrics,
     kv_router::indexer::try_build_cache_indexer,
     kv_router::{
-        EncoderRouter, KvPushRouter, KvRouter, PrefillRouter, metrics::RouterRequestMetrics,
+        EncoderRouter, KvPushRouter, KvRouter, MultimodalEpdRouter, PrefillRouter,
+        metrics::RouterRequestMetrics,
     },
     lora::LoraFilteredRouter,
     migration::Migration,
@@ -23,6 +24,7 @@ use crate::{
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
     protocols::common::{
         llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
+        multimodal_epd::vllm_embedding_cache_key,
         preprocessor::MultimodalData,
     },
     request_template::RequestTemplate,
@@ -51,7 +53,7 @@ use dynamo_runtime::{
 use std::sync::Arc;
 
 fn multimodal_cache_key_from_url(url: &str) -> String {
-    blake3::hash(url.as_bytes()).to_hex().to_string()
+    vllm_embedding_cache_key(url)
 }
 
 fn preprocessed_multimodal_cache_keys(request: &PreprocessedRequest) -> Vec<String> {
@@ -500,6 +502,11 @@ impl PreprocessedRouting {
         let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
             .into_operator_for::<BackendOutput>();
+        let multimodal_epd_op = MultimodalEpdRouter::from_env(
+            self.prefill_router.clone(),
+            self.encoder_router.clone(),
+        )?
+        .into_operator();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -508,11 +515,13 @@ impl PreprocessedRouting {
             .link(preprocessor_op.forward_edge())?
             .link(migration.forward_edge())?
             .link(token_backend.forward_edge())?
+            .link(multimodal_epd_op.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
             .link(backend)?
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
+            .link(multimodal_epd_op.backward_edge())?
             .link(token_backend.backward_edge())?
             .link(migration.backward_edge())?
             .link(preprocessor_op.backward_edge())?
@@ -538,17 +547,24 @@ impl PreprocessedRouting {
         >::new();
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
             .into_operator_for::<LLMEngineOutput>();
+        let multimodal_epd_op = MultimodalEpdRouter::from_env(
+            self.prefill_router.clone(),
+            self.encoder_router.clone(),
+        )?
+        .into_operator();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
 
         let engine = frontend
             .link(migration.forward_edge())?
+            .link(multimodal_epd_op.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
             .link(backend)?
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
+            .link(multimodal_epd_op.backward_edge())?
             .link(migration.backward_edge())?
             .link(frontend)?;
 

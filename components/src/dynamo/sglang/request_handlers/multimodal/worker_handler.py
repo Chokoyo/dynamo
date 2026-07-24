@@ -4,19 +4,40 @@
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from typing import Any, AsyncIterator, Callable, Literal, Optional, Protocol
 
 import sglang as sgl
 import torch
+from sglang.srt.parser.conversation import chat_templates
+from transformers import AutoTokenizer
 
 from dynamo._core import Client, Context
 from dynamo.common.constants import DisaggregationMode, EmbeddingTransferMode
+from dynamo.common.memory.multimodal_embedding_cache_manager import (
+    CachedEmbedding,
+    MultimodalEmbeddingCacheManager,
+)
 from dynamo.common.multimodal import EMBEDDING_RECEIVER_FACTORIES, TransferRequest
+from dynamo.common.multimodal_epd import MMSourceKind
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
+from dynamo.llm import MultimodalEmbeddingCachePublisher
 from dynamo.sglang.args import Config
+from dynamo.sglang.multimodal_epd import (
+    enforced_routing_plan,
+    extract_media_objects,
+    parse_planned_media_objects,
+    target_prefill_worker,
+    validate_object_response_indices,
+)
 from dynamo.sglang.protocol import (
     DisaggSglangMultimodalRequest,
+    MultiModalGroup,
+    MultiModalInput,
+    PreprocessedRequest,
+    SglangEpdObjectRequest,
+    SglangEpdObjectResponse,
     SglangMultimodalRequest,
 )
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
@@ -47,15 +68,13 @@ class MultimodalConfig:
 class EmbeddingsProcessorLike(Protocol):
     async def process_embeddings(
         self, request: SglangMultimodalRequest
-    ) -> tuple[torch.Tensor, int]:
-        ...
+    ) -> tuple[torch.Tensor, int]: ...
 
     def create_multimodal_image_item(
         self,
         embeddings: torch.Tensor,
         image_grid_thw: list[Any],
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
     def create_multimodal_video_item(
         self,
@@ -63,8 +82,7 @@ class EmbeddingsProcessorLike(Protocol):
         video_grid_thw: list[Any],
         second_per_grid_ts: list[float] | None = None,
         video_timestamps: list[list[float]] | None = None,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
 
 class SglangUtils:
@@ -443,11 +461,34 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
 
     def _validate_and_parse_request(self, request) -> SglangMultimodalRequest:
         """Validate and parse incoming request"""
+        if isinstance(request, str):
+            request = json.loads(request)
+        if (
+            isinstance(request, dict)
+            and "token_ids" in request
+            and "request" not in request
+        ):
+            preprocessed = PreprocessedRequest.model_validate(request)
+            groups = []
+            for media_object in extract_media_objects(preprocessed):
+                groups.append(
+                    MultiModalGroup(
+                        multimodal_input=MultiModalInput(
+                            image_url=media_object.url
+                            if media_object.modality == "IMAGE"
+                            else None,
+                            video_url=media_object.url
+                            if media_object.modality == "VIDEO"
+                            else None,
+                        )
+                    )
+                )
+            return SglangMultimodalRequest(
+                request=preprocessed,
+                multimodal_inputs=groups,
+            )
         if type(request) is not SglangMultimodalRequest:
-            if type(request) is str:
-                request = SglangMultimodalRequest.model_validate_json(request)
-            else:
-                request = SglangMultimodalRequest.model_validate(request)
+            request = SglangMultimodalRequest.model_validate(request)
         return request
 
     async def generate(
@@ -525,7 +566,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
 
         # Start decode generation with bootstrap info (no image data needed)
         decode_stream = await self.engine.async_generate(
-            input_ids=input_ids,
+            input_ids=bootstrap_info.get("input_ids", input_ids),
             sampling_params=sampling_params,
             stream=True,
             bootstrap_host=bootstrap_info["bootstrap_host"],
@@ -641,13 +682,26 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
     ) -> dict:
         """Get bootstrap info from prefill worker"""
         assert self.prefill_client is not None
-        prefill_stream = await self.prefill_client.generate(
-            DisaggSglangMultimodalRequest(
-                request=request,
-                sampling_params=sampling_params,
-            ).model_dump_json(),
-            context=context,
-        )
+        payload = DisaggSglangMultimodalRequest(
+            request=request,
+            sampling_params=sampling_params,
+        ).model_dump_json()
+        target_worker_id = target_prefill_worker(request.request)
+        if target_worker_id is None:
+            prefill_stream = await self.prefill_client.generate(
+                payload,
+                context=context,
+            )
+        else:
+            logger.info(
+                "SGLang EPD decode routing request to prefill worker %s",
+                target_worker_id,
+            )
+            prefill_stream = await self.prefill_client.direct(
+                payload,
+                target_worker_id,
+                context=context,
+            )
 
         bootstrap_info = None
         async for info in prefill_stream:
@@ -681,13 +735,36 @@ class MultimodalPrefillWorkerHandler(
         self,
         engine: sgl.Engine,
         config: Config,
+        encode_worker_client: Client,
+        cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
         shutdown_event: Optional[asyncio.Event] = None,
     ):
         super().__init__(engine, config, None, None, shutdown_event)
+        self.encode_worker_client = encode_worker_client
+        self._cache_publisher = cache_publisher
 
         # Initialize processors
         self.embeddings_processor = EmbeddingsProcessor(
             config.dynamo_args.embedding_transfer_mode
+        )
+
+        self._embedding_cache: MultimodalEmbeddingCacheManager | None = None
+        capacity_gb = config.dynamo_args.multimodal_embedding_cache_capacity_gb
+        if capacity_gb > 0:
+            self._embedding_cache = MultimodalEmbeddingCacheManager(
+                int(capacity_gb * 1024**3)
+            )
+
+        self.model = config.server_args.model_path
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model, trust_remote_code=config.server_args.trust_remote_code
+        )
+        template = chat_templates[getattr(config.server_args, "chat_template")].copy()
+        self.image_token_id = self._resolve_mm_token_id(
+            tokenizer, template.image_token, "<|image_pad|>"
+        )
+        self.video_token_id = self._resolve_mm_token_id(
+            tokenizer, getattr(template, "video_token", None), "<|video_pad|>"
         )
 
         # Get bootstrap info using BootstrapManager
@@ -696,6 +773,281 @@ class MultimodalPrefillWorkerHandler(
         logger.info(
             f"Multimodal prefill worker handler initialized - bootstrap host: {self.bootstrap_host}, bootstrap port: {self.bootstrap_port}"
         )
+
+    @staticmethod
+    def _resolve_mm_token_id(
+        tokenizer, token: str | None, preferred: str
+    ) -> int | None:
+        candidates = [preferred]
+        if token and token not in candidates:
+            candidates.append(token)
+        for candidate in candidates:
+            token_id = tokenizer.convert_tokens_to_ids(candidate)
+            if isinstance(token_id, int) and token_id >= 0:
+                return token_id
+        return None
+
+    def _publish_cache_delta(
+        self, added_keys: list[str], removed_keys: list[str]
+    ) -> None:
+        if self._cache_publisher is None or (not added_keys and not removed_keys):
+            return
+        try:
+            self._cache_publisher.publish_delta(added_keys, removed_keys)
+        except Exception:
+            logger.warning(
+                "Failed to publish SGLang prefill cache delta", exc_info=True
+            )
+
+    @staticmethod
+    async def _first_object_response(stream) -> tuple[SglangEpdObjectResponse, Any]:
+        response = await anext(stream)
+        raw = response.data() if hasattr(response, "data") else response
+        if isinstance(raw, str):
+            parsed = SglangEpdObjectResponse.model_validate_json(raw)
+        else:
+            parsed = SglangEpdObjectResponse.model_validate(raw)
+        return parsed, stream
+
+    @staticmethod
+    async def _drain_stream(stream) -> None:
+        async for _ in stream:
+            pass
+
+    def _expand_object_placeholders(
+        self, request: SglangMultimodalRequest, entries: list[CachedEmbedding]
+    ) -> None:
+        search_offsets = {"IMAGE": 0, "VIDEO": 0}
+        media_objects = extract_media_objects(request.request)
+        for media_object, entry in zip(media_objects, entries, strict=True):
+            token_id = (
+                self.image_token_id
+                if media_object.modality == "IMAGE"
+                else self.video_token_id
+            )
+            if token_id is None:
+                raise ValueError(
+                    f"{media_object.modality.lower()} token is not defined"
+                )
+            try:
+                token_index = request.request.token_ids.index(
+                    token_id, search_offsets[media_object.modality]
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"not enough {media_object.modality.lower()} placeholders"
+                ) from error
+            token_count = int(entry.tensor.shape[0])
+            request.request.token_ids = (
+                request.request.token_ids[:token_index]
+                + [token_id] * token_count
+                + request.request.token_ids[token_index + 1 :]
+            )
+            search_offsets[media_object.modality] = token_index + token_count
+
+    async def _coordinate_epd_objects(
+        self, request: SglangMultimodalRequest, context: Context | None
+    ) -> tuple[list[dict], list[dict]]:
+        available_workers = set(self.encode_worker_client.instance_ids())
+        planned = parse_planned_media_objects(
+            request.request,
+            available_encode_worker_ids=available_workers,
+        )
+        if planned is None:
+            raise ValueError("invalid or incomplete enforced SGLang EPD object plan")
+
+        entries: list[CachedEmbedding | None] = [None] * len(planned)
+        remote_by_worker: dict[int, list[Any]] = defaultdict(list)
+        for item in planned:
+            if item.plan.source_kind is MMSourceKind.P_LOCAL:
+                cached = (
+                    self._embedding_cache.get(item.cache_key)
+                    if self._embedding_cache is not None
+                    else None
+                )
+                if cached is not None:
+                    logger.info(
+                        "SGLang EPD prefill cache hit for object %s",
+                        item.object_index,
+                    )
+                    entries[item.object_index] = cached
+                    continue
+                if item.url is None:
+                    raise RuntimeError(
+                        f"UUID-only object {item.object_index} disappeared from P-local cache"
+                    )
+                if not available_workers:
+                    raise RuntimeError(
+                        "stale P-local plan and no encode worker is live"
+                    )
+                fallback_worker = min(available_workers)
+                remote_by_worker[fallback_worker].append(item)
+            else:
+                remote_by_worker[item.plan.source_worker_id].append(item)
+
+        async def dispatch(worker_id: int, items: list[Any]):
+            payload = SglangEpdObjectRequest(
+                objects=[
+                    {
+                        "object_index": item.object_index,
+                        "modality": item.modality,
+                        "url": item.url,
+                        "expected_cache_key": item.cache_key,
+                    }
+                    for item in items
+                ]
+            ).model_dump_json()
+            attempted_workers: set[int] = set()
+            candidate_worker = worker_id
+            while True:
+                attempted_workers.add(candidate_worker)
+                stream = None
+                try:
+                    stream = await self.encode_worker_client.direct(
+                        payload, candidate_worker, context=context
+                    )
+                    response, stream = await self._first_object_response(stream)
+                    logger.info(
+                        "SGLang EPD prefill received objects %s from encode worker %s",
+                        [item.object_index for item in items],
+                        candidate_worker,
+                    )
+                    return items, response, stream
+                except Exception:
+                    if stream is not None and hasattr(stream, "aclose"):
+                        await stream.aclose()
+                    fallback_workers = sorted(
+                        set(self.encode_worker_client.instance_ids())
+                        - attempted_workers
+                    )
+                    if not fallback_workers:
+                        raise
+                    if any(item.url is None for item in items):
+                        raise RuntimeError(
+                            "UUID-only embedding holder disappeared; source media is unavailable"
+                        )
+                    next_worker = fallback_workers[0]
+                    logger.warning(
+                        "SGLang EPD object dispatch to encode worker %s failed; "
+                        "retrying URL objects on worker %s",
+                        candidate_worker,
+                        next_worker,
+                        exc_info=True,
+                    )
+                    candidate_worker = next_worker
+
+        dispatches = await asyncio.gather(
+            *(
+                dispatch(worker_id, items)
+                for worker_id, items in remote_by_worker.items()
+            )
+        )
+        expected_remote = [item for items, _, _ in dispatches for item in items]
+        returned_parts = [
+            part for _, response, _ in dispatches for part in response.parts
+        ]
+        validate_object_response_indices(
+            expected_remote, [part.object_index for part in returned_parts]
+        )
+        expected_by_index = {item.object_index: item for item in expected_remote}
+
+        async def receive_part(part):
+            expected = expected_by_index[part.object_index]
+            if part.modality != expected.modality:
+                raise ValueError("encode response modality does not match request")
+            if part.cache_key != expected.cache_key:
+                raise ValueError("encode response cache key does not match request")
+            (
+                tensor_id,
+                tensor,
+            ) = await self.embeddings_processor.embedding_receiver.receive_embeddings(
+                part.transfer_payload
+            )
+            try:
+                if tuple(tensor.shape) != tuple(part.embeddings_shape):
+                    raise ValueError(
+                        "received embedding shape does not match descriptor"
+                    )
+                entry = CachedEmbedding(
+                    tensor=tensor.detach().cpu().contiguous().clone(),
+                    image_grid_thw=part.grid_thw if part.modality == "IMAGE" else None,
+                    video_grid_thw=part.grid_thw if part.modality == "VIDEO" else None,
+                    second_per_grid_ts=part.second_per_grid_ts,
+                    video_timestamps=part.video_timestamps,
+                )
+            finally:
+                self.embeddings_processor.release_embeddings(tensor_id)
+            return part.object_index, part.cache_key, entry
+
+        receive_tasks = [
+            asyncio.create_task(receive_part(part)) for part in returned_parts
+        ]
+        try:
+            loaded = await asyncio.gather(*receive_tasks)
+            await asyncio.gather(
+                *(self._drain_stream(stream) for _, _, stream in dispatches)
+            )
+        except BaseException:
+            for task in receive_tasks:
+                task.cancel()
+            await asyncio.gather(*receive_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(
+                    stream.aclose()
+                    for _, _, stream in dispatches
+                    if hasattr(stream, "aclose")
+                ),
+                return_exceptions=True,
+            )
+            raise
+        for object_index, cache_key, entry in loaded:
+            entries[object_index] = entry
+            if self._embedding_cache is not None:
+                mutation = self._embedding_cache.set_with_delta(cache_key, entry)
+                self._publish_cache_delta(mutation.added_keys, mutation.removed_keys)
+
+        if any(entry is None for entry in entries):
+            raise ValueError("SGLang EPD object plan did not resolve every object")
+        resolved = [entry for entry in entries if entry is not None]
+        self._expand_object_placeholders(request, resolved)
+
+        image_entries = [
+            entry
+            for item, entry in zip(planned, resolved, strict=True)
+            if item.modality == "IMAGE"
+        ]
+        video_entries = [
+            entry
+            for item, entry in zip(planned, resolved, strict=True)
+            if item.modality == "VIDEO"
+        ]
+        image_items: list[dict] = []
+        video_items: list[dict] = []
+        if image_entries:
+            image_items.append(
+                self.embeddings_processor.create_multimodal_image_item(
+                    torch.cat([entry.tensor for entry in image_entries], dim=0),
+                    [entry.image_grid_thw for entry in image_entries],
+                )
+            )
+        if video_entries:
+            video_items.append(
+                self.embeddings_processor.create_multimodal_video_item(
+                    torch.cat([entry.tensor for entry in video_entries], dim=0),
+                    [entry.video_grid_thw for entry in video_entries],
+                    [entry.second_per_grid_ts for entry in video_entries]
+                    if all(
+                        entry.second_per_grid_ts is not None for entry in video_entries
+                    )
+                    else None,
+                    [entry.video_timestamps for entry in video_entries]
+                    if all(
+                        entry.video_timestamps is not None for entry in video_entries
+                    )
+                    else None,
+                )
+            )
+        return image_items, video_items
 
     async def generate(
         self, disagg_request: DisaggSglangMultimodalRequest, context: Context
@@ -721,6 +1073,13 @@ class MultimodalPrefillWorkerHandler(
             # Validate and parse request
             disagg_request = self._validate_and_parse_disagg_request(disagg_request)
 
+            prepared_mm_items: tuple[list[dict], list[dict]] | None = None
+            if enforced_routing_plan(disagg_request.request.request) is not None:
+                with _nvtx.annotate("mm:prefill:epd_coordinate", color="orange"):
+                    prepared_mm_items = await self._coordinate_epd_objects(
+                        disagg_request.request, context
+                    )
+
             # Generate and return bootstrap info first (like regular SGLang)
             bootstrap_room = self._generate_bootstrap_room()
             bootstrap_info = {
@@ -728,13 +1087,18 @@ class MultimodalPrefillWorkerHandler(
                 "bootstrap_port": self.bootstrap_port,
                 "bootstrap_room": bootstrap_room,
             }
+            if prepared_mm_items is not None:
+                bootstrap_info["input_ids"] = disagg_request.request.request.token_ids
 
             _end_bootstrap()
             yield json.dumps(bootstrap_info)
 
             # Process prefill generation
             await self._process_prefill_generation(
-                disagg_request, bootstrap_room, context=context
+                disagg_request,
+                bootstrap_room,
+                context=context,
+                prepared_mm_items=prepared_mm_items,
             )
 
         except Exception as e:
@@ -766,6 +1130,7 @@ class MultimodalPrefillWorkerHandler(
         disagg_request: DisaggSglangMultimodalRequest,
         bootstrap_room: int,
         context=None,
+        prepared_mm_items: tuple[list[dict], list[dict]] | None = None,
     ):
         """Process multimodal input and start prefill generation"""
         # Get the SglangMultimodalRequest from the DisaggSglangMultimodalRequest
@@ -775,13 +1140,16 @@ class MultimodalPrefillWorkerHandler(
         tensor_id: int | None = None
 
         # Process embeddings from encode worker using our embeddings processor
-        with _nvtx.annotate("mm:prefill:load_multimodal", color="cyan"):
-            (
-                image_mm_items,
-                video_data,
-                _,
-                tensor_id,
-            ) = await _build_mm_items(request, self.embeddings_processor)
+        if prepared_mm_items is None:
+            with _nvtx.annotate("mm:prefill:load_multimodal", color="cyan"):
+                (
+                    image_mm_items,
+                    video_data,
+                    _,
+                    tensor_id,
+                ) = await _build_mm_items(request, self.embeddings_processor)
+        else:
+            image_mm_items, video_data = prepared_mm_items
 
         trace_header = (
             context.trace_headers() if context and self.enable_trace else None

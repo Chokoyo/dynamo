@@ -4,6 +4,8 @@
 import asyncio
 import logging
 import os
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List
 
 import torch
@@ -13,11 +15,13 @@ from dynamo.common.memory.multimodal_embedding_cache_manager import (
     CachedEmbedding,
     MultimodalEmbeddingCacheManager,
 )
+from dynamo.common.multimodal_epd import MMObjectPlan, MMSourceKind
 from dynamo.common.multimodal.embedding_transfer import (
     AbstractEmbeddingReceiver,
     LocalEmbeddingReceiver,
 )
 from dynamo.common.utils.time_section import time_and_log_code_section
+from dynamo.llm import MultimodalEmbeddingCachePublisher
 from dynamo.runtime import Client
 
 from .encode_utils import get_embedding_hash
@@ -59,6 +63,52 @@ class _PendingRelease:
         for tid in self._tensor_ids:
             self._receiver.release_tensor(tid)
         self._tensor_ids.clear()
+
+
+def _parse_object_plans(
+    routing_plan: Mapping[str, Any] | None,
+    *,
+    object_count: int,
+    available_worker_ids: set[int],
+) -> tuple[MMObjectPlan, ...] | None:
+    """Validate an enforced object plan or return ``None`` for legacy routing."""
+    if routing_plan is None:
+        return None
+    try:
+        raw_objects = routing_plan["objects"]
+        if not isinstance(raw_objects, list) or len(raw_objects) != object_count:
+            raise ValueError("object plan must cover every image exactly once")
+
+        plans: list[MMObjectPlan] = []
+        for expected_index, raw in enumerate(raw_objects):
+            if not isinstance(raw, Mapping):
+                raise ValueError("object plan entries must be objects")
+            object_index = int(raw["object_index"])
+            if object_index != expected_index:
+                raise ValueError("object plan indices must be contiguous and ordered")
+            source_kind = MMSourceKind(str(raw["source_kind"]))
+            worker_id = int(raw["source_worker_id"])
+            worker_generation = int(raw["source_worker_generation"])
+            if worker_generation < 0:
+                raise ValueError("worker generation must be non-negative")
+            if (
+                source_kind is not MMSourceKind.P_LOCAL
+                and worker_id not in available_worker_ids
+            ):
+                raise ValueError(f"planned encode worker {worker_id} is unavailable")
+            plans.append(
+                MMObjectPlan(
+                    object_index=object_index,
+                    source_kind=source_kind,
+                    source_worker_id=worker_id,
+                    source_worker_generation=worker_generation,
+                    estimated_cost_ms=float(raw.get("estimated_cost_ms", 0.0)),
+                )
+            )
+        return tuple(plans)
+    except (KeyError, TypeError, ValueError) as error:
+        logger.warning("Ignoring invalid multimodal EPD object plan: %s", error)
+        return None
 
 
 def _accumulate_embeddings(
@@ -139,6 +189,7 @@ async def _fetch_from_encode_workers(
     image_urls: List[str],
     request_id: str,
     receiver: AbstractEmbeddingReceiver,
+    object_plans: Sequence[MMObjectPlan] | None = None,
     context=None,
 ) -> tuple[List[MultiModalGroup], _PendingRelease | None]:
     """Fan out image URLs to encode workers, load embeddings, and return ready groups.
@@ -147,9 +198,12 @@ async def _fetch_from_encode_workers(
     pre-allocated buffers.  The returned ``_PendingRelease`` must be
     released after the tensors have been consumed.
     """
-    encode_worker_count = len(encode_worker_client.instance_ids())
+    encode_worker_ids = encode_worker_client.instance_ids()
+    encode_worker_count = len(encode_worker_ids)
     if encode_worker_count == 0:
         raise RuntimeError("No encode workers available to process multimodal input")
+    if object_plans is not None and len(object_plans) != len(image_urls):
+        raise ValueError("object plan count must match the number of image URLs")
 
     encode_batch_size = (
         max(1, len(image_urls) // encode_worker_count)
@@ -157,45 +211,130 @@ async def _fetch_from_encode_workers(
         else len(image_urls)
     )
 
-    encode_request = vLLMMultimodalRequest(
-        engine_prompt=PatchedTokensPrompt(prompt_token_ids=[]),
-        sampling_params=VllmSamplingParams(),
-        request_id=request_id,
-        multimodal_inputs=[],
-    )
+    def make_request(groups: list[MultiModalGroup]) -> str:
+        return vLLMMultimodalRequest(
+            engine_prompt=PatchedTokensPrompt(prompt_token_ids=[]),
+            sampling_params=VllmSamplingParams(),
+            request_id=request_id,
+            multimodal_inputs=groups,
+        ).model_dump_json()
+
+    async def collect(stream) -> list[MultiModalGroup]:
+        collected: list[MultiModalGroup] = []
+        async for response in stream:
+            output = vLLMMultimodalRequest.model_validate_json(response.data())  # type: ignore[attr-defined]
+            if output.multimodal_inputs:
+                collected.extend(output.multimodal_inputs)
+        return collected
+
+    def validate_response(indices: list[int], collected: list[MultiModalGroup]) -> None:
+        if len(indices) != len(collected):
+            raise ValueError(
+                "encode worker returned a different object count than requested"
+            )
+        for index, group in zip(indices, collected, strict=True):
+            returned_input = group.multimodal_input
+            returned_url = (
+                returned_input.image_url if returned_input is not None else None
+            )
+            if returned_url != image_urls[index]:
+                raise ValueError(
+                    "encode worker returned a multimodal object with a mismatched URL"
+                )
+
+    async def dispatch_and_collect(
+        indices: list[int], worker_id: int | None
+    ) -> list[MultiModalGroup]:
+        payload = make_request([groups[index] for index in indices])
+        if worker_id is None:
+            stream = await encode_worker_client.round_robin(  # type: ignore[arg-type]
+                payload, context=context
+            )
+        else:
+            stream = await encode_worker_client.direct(  # type: ignore[arg-type]
+                payload,
+                worker_id,
+                context=context,
+            )
+        collected = await collect(stream)
+        validate_response(indices, collected)
+        return collected
+
+    def alternate_worker(failed_worker_id: int) -> int | None:
+        return next(
+            (
+                worker_id
+                for worker_id in encode_worker_ids
+                if worker_id != failed_worker_id
+            ),
+            None,
+        )
 
     with time_and_log_code_section(f"[PREFILL] request: {request_id} dispatch encode"):
-        batch: List[MultiModalGroup] = []
-        encode_response_streams = []
-        for url in image_urls:
-            multimodal_input = MultiModalInput()
-            multimodal_input.image_url = url
-            batch.append(MultiModalGroup(multimodal_input=multimodal_input))
-
-            if len(batch) >= encode_batch_size:
-                encode_request.multimodal_inputs = batch
-                payload = encode_request.model_dump_json()
-                encode_response_streams.append(
-                    await encode_worker_client.round_robin(payload, context=context)  # type: ignore[arg-type]
+        groups = [
+            MultiModalGroup(multimodal_input=MultiModalInput(image_url=url))
+            for url in image_urls
+        ]
+        dispatches: list[tuple[list[int], int | None]] = []
+        if object_plans is None:
+            for start in range(0, len(groups), encode_batch_size):
+                indices = list(
+                    range(start, min(start + encode_batch_size, len(groups)))
                 )
-                batch = []
-
-        if batch:
-            encode_request.multimodal_inputs = batch
-            payload = encode_request.model_dump_json()
-            encode_response_streams.append(
-                await encode_worker_client.round_robin(payload, context=context)  # type: ignore[arg-type]
-            )
+                dispatches.append((indices, None))
+        else:
+            by_worker: dict[int, list[int]] = defaultdict(list)
+            for index, plan in enumerate(object_plans):
+                if plan.source_kind is MMSourceKind.P_LOCAL:
+                    raise ValueError(
+                        "P_LOCAL object cannot be dispatched to an encode worker"
+                    )
+                by_worker[plan.source_worker_id].append(index)
+            dispatches = [
+                (indices, worker_id) for worker_id, indices in by_worker.items()
+            ]
 
     with time_and_log_code_section(
         f"[PREFILL] request: {request_id} receive encode responses"
     ):
-        multimodal_groups: List[MultiModalGroup] = []
-        for stream in encode_response_streams:
-            async for response in stream:
-                output = vLLMMultimodalRequest.model_validate_json(response.data())  # type: ignore[attr-defined]
-                if output.multimodal_inputs:
-                    multimodal_groups.extend(output.multimodal_inputs)
+        collected_batches = await asyncio.gather(
+            *(
+                dispatch_and_collect(indices, worker_id)
+                for indices, worker_id in dispatches
+            ),
+            return_exceptions=True,
+        )
+        ordered_groups: list[MultiModalGroup | None] = [None] * len(image_urls)
+        for (indices, worker_id), collected in zip(
+            dispatches, collected_batches, strict=True
+        ):
+            if isinstance(collected, BaseException):
+                if worker_id is None:
+                    raise collected
+                retry_worker_id = alternate_worker(worker_id)
+                logger.warning(
+                    "Planned multimodal encode worker %s failed validation for request "
+                    "%s; retrying %s object(s) via %s",
+                    worker_id,
+                    request_id,
+                    len(indices),
+                    (
+                        f"encode worker {retry_worker_id}"
+                        if retry_worker_id is not None
+                        else "legacy round-robin routing"
+                    ),
+                    exc_info=(
+                        type(collected),
+                        collected,
+                        collected.__traceback__,
+                    ),
+                )
+                collected = await dispatch_and_collect(indices, retry_worker_id)
+            for index, group in zip(indices, collected, strict=True):
+                ordered_groups[index] = group
+        if any(group is None for group in ordered_groups):
+            raise ValueError("encode worker response omitted a multimodal object")
+        multimodal_groups = [group for group in ordered_groups if group is not None]
 
     with time_and_log_code_section(
         f"[PREFILL] request: {request_id} receive embeddings"
@@ -223,6 +362,8 @@ async def _fetch_embeddings(
     request_id: str,
     receiver: AbstractEmbeddingReceiver,
     cache: MultimodalEmbeddingCacheManager | None = None,
+    cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
+    routing_plan: Mapping[str, Any] | None = None,
     context=None,
 ) -> tuple[list[MultiModalGroup], _PendingRelease | None]:
     """Fetch multimodal embeddings with transparent cache-through.
@@ -235,8 +376,18 @@ async def _fetch_embeddings(
     returned ``_PendingRelease`` must be released after consuming the
     tensors.
     """
+    object_plans = (
+        _parse_object_plans(
+            routing_plan,
+            object_count=len(image_urls),
+            available_worker_ids=set(encode_worker_client.instance_ids()),
+        )
+        if routing_plan is not None
+        else None
+    )
     results: list[MultiModalGroup | None] = [None] * len(image_urls)
-    to_fetch: list[tuple[int, str, str | None]] = []
+    to_fetch: list[tuple[int, str, str | None, MMObjectPlan | None]] = []
+    stale_local_plan = False
 
     # ── 1. Check cache (no-op when cache is None) ────────────────────
     for idx, url in enumerate(image_urls):
@@ -252,32 +403,60 @@ async def _fetch_embeddings(
                 continue
         else:
             key = None
-        to_fetch.append((idx, url, key))
+        object_plan = object_plans[idx] if object_plans is not None else None
+        if object_plan is not None and object_plan.source_kind is MMSourceKind.P_LOCAL:
+            stale_local_plan = True
+        to_fetch.append((idx, url, key, object_plan))
+
+    if stale_local_plan:
+        logger.warning(
+            "Ignoring stale multimodal EPD plan for request %s: planned P-local "
+            "embedding is absent",
+            request_id,
+        )
+        object_plans = None
+        to_fetch = [(idx, url, key, None) for idx, url, key, _ in to_fetch]
 
     # ── 2. Fetch uncached from encode workers ────────────────────────
     pending: _PendingRelease | None = None
     if to_fetch:
-        miss_urls = [url for _, url, _ in to_fetch]
+        miss_urls = [url for _, url, _, _ in to_fetch]
+        miss_plans = (
+            [plan for _, _, _, plan in to_fetch if plan is not None]
+            if object_plans is not None
+            else None
+        )
         groups, pending = await _fetch_from_encode_workers(
             encode_worker_client,
             miss_urls,
             request_id,
             receiver,
+            object_plans=miss_plans,
             context=context,
         )
 
         # ── 3. Update cache (no-op when cache is None) ──────────────
 
-        for (idx, _url, key), group in zip(to_fetch, groups, strict=True):
+        for (idx, _url, key, _plan), group in zip(to_fetch, groups, strict=True):
             if cache is not None and key is not None:
                 assert group.loaded_embedding is not None
-                cache.set(
+                mutation = cache.set_with_delta(
                     key,
                     CachedEmbedding(
                         tensor=group.loaded_embedding.clone(),
                         image_grid_thw=group.image_grid_thw,
                     ),
                 )
+                if cache_publisher is not None:
+                    try:
+                        cache_publisher.publish_delta(
+                            mutation.added_keys, mutation.removed_keys
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to publish vLLM prefill cache delta",
+                            exc_info=True,
+                        )
             results[idx] = group
 
     return [r for r in results if r is not None], pending
@@ -294,10 +473,48 @@ class MultiModalEmbeddingLoader:
         encode_worker_client: Client,
         receiver: AbstractEmbeddingReceiver,
         embedding_cache_manager: MultimodalEmbeddingCacheManager | None = None,
+        cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         self._encode_worker_client = encode_worker_client
         self._receiver = receiver
         self._embedding_cache_manager = embedding_cache_manager
+        self._cache_publisher = cache_publisher
+
+    async def load_multimodal_embedding_parts(
+        self,
+        image_urls: list[str],
+        request_id: str,
+        *,
+        model: str,
+        routing_plan: Mapping[str, Any] | None = None,
+        context=None,
+    ) -> list[CachedEmbedding]:
+        """Fetch ordered, owned embedding parts for the post-KV connector path."""
+        if self._encode_worker_client is None or not image_urls:
+            return []
+        groups, pending = await _fetch_embeddings(
+            self._encode_worker_client,
+            image_urls,
+            request_id,
+            self._receiver,
+            cache=self._embedding_cache_manager,
+            cache_publisher=self._cache_publisher,
+            routing_plan=routing_plan,
+            context=context,
+        )
+        parts = []
+        for group in groups:
+            if group.loaded_embedding is None:
+                raise ValueError("encode worker returned no embedding tensor")
+            parts.append(
+                CachedEmbedding(
+                    tensor=group.loaded_embedding.clone(),
+                    image_grid_thw=group.image_grid_thw,
+                )
+            )
+        if pending is not None:
+            pending.release_all()
+        return parts
 
     async def load_multimodal_embeddings(
         self,
@@ -305,6 +522,7 @@ class MultiModalEmbeddingLoader:
         request_id: str,
         *,
         model: str,
+        routing_plan: Mapping[str, Any] | None = None,
         context=None,
     ) -> Dict[str, Any]:
         """Fetch embeddings and build engine-ready ``multi_modal_data``.
@@ -323,6 +541,8 @@ class MultiModalEmbeddingLoader:
             request_id,
             self._receiver,
             cache=self._embedding_cache_manager,
+            cache_publisher=self._cache_publisher,
+            routing_plan=routing_plan,
             context=context,
         )
 

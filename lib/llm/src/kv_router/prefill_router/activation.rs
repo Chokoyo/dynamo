@@ -19,7 +19,10 @@ use dynamo_runtime::{
 use super::{InnerPrefillRouter, PrefillLifecycleState, PrefillRouter};
 use crate::{
     discovery::ModelManager,
-    kv_router::KvPushRouter,
+    kv_router::{
+        KvPushRouter, indexer::try_build_cache_indexer,
+        multimodal_epd_router::cache_index_enabled_from_env,
+    },
     model_card::ModelDeploymentCard,
     protocols::common::{
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -37,6 +40,7 @@ impl PrefillRouter {
     ) -> Arc<Self> {
         Arc::new(Self {
             prefill_router: std::sync::OnceLock::new(),
+            embedding_cache_index: std::sync::OnceLock::new(),
             model_manager,
             endpoint_id: std::sync::OnceLock::new(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -69,6 +73,7 @@ impl PrefillRouter {
 
         let router = Arc::new(Self {
             prefill_router,
+            embedding_cache_index: std::sync::OnceLock::new(),
             model_manager: model_manager.clone(),
             endpoint_id: std::sync::OnceLock::new(),
             cancel_token: cancel_token.clone(),
@@ -128,6 +133,11 @@ impl PrefillRouter {
 
         // Store endpoint metadata for bootstrap and topology preparation.
         let _ = self.endpoint_id.set(endpoint.id());
+        if cache_index_enabled_from_env()
+            && let Some(index) = try_build_cache_indexer(&endpoint).await
+        {
+            let _ = self.embedding_cache_index.set(index);
+        }
 
         // Start runtime config watcher for this endpoint (needed for get_disaggregated_endpoint)
         // This must be done before creating the router so bootstrap info is available

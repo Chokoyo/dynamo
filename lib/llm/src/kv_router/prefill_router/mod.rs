@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, OnceLock};
 
@@ -14,8 +15,8 @@ use dynamo_kv_router::{
 };
 use dynamo_runtime::{
     pipeline::{
-        AsyncEngineContextProvider, Context, ManyOut, Operator, RouterMode, ServerStreamingEngine,
-        SingleIn, async_trait,
+        AsyncEngineContextProvider, Context, ManyOut, MultimodalCacheIndex, Operator, RouterMode,
+        ServerStreamingEngine, SingleIn, async_trait,
     },
     protocols::{EndpointId, annotated::Annotated},
 };
@@ -121,6 +122,17 @@ pub enum PrefillQueryOutcome {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrefillCandidateSnapshot {
+    pub worker_id: u64,
+    pub dp_rank: u32,
+    pub effective_overlap_blocks: f64,
+    pub cached_tokens: usize,
+    pub potential_prefill_tokens: usize,
+    pub potential_decode_blocks: usize,
+    pub active_requests: usize,
+}
+
 struct PrefillCompletion {
     result: PrefillResult,
     worker_link: Option<TraceLink>,
@@ -136,6 +148,7 @@ struct PrefillCompletion {
 /// - Normal: Worker IDs determined by router based on KV cache state
 pub struct PrefillRouter {
     prefill_router: OnceLock<InnerPrefillRouter>,
+    embedding_cache_index: OnceLock<Arc<dyn MultimodalCacheIndex>>,
     model_manager: Arc<ModelManager>,
     endpoint_id: OnceLock<EndpointId>,
     cancel_token: CancellationToken,
@@ -339,6 +352,30 @@ impl
 }
 
 impl PrefillRouter {
+    pub fn live_worker_ids(&self) -> Vec<u64> {
+        let mut workers = self
+            .prefill_router
+            .get()
+            .map(|router| router.client().instance_ids_avail())
+            .unwrap_or_default();
+        workers.sort_unstable();
+        workers
+    }
+
+    pub fn live_workers_for_cache_key(&self, cache_key: &str) -> Vec<u64> {
+        let live_workers = self.live_worker_ids().into_iter().collect::<HashSet<_>>();
+        self.embedding_cache_index
+            .get()
+            .map(|index| {
+                index
+                    .workers_for_cache_key(cache_key)
+                    .into_iter()
+                    .filter(|worker_id| live_workers.contains(worker_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn prepare_prefill_dispatch(
         &self,
         request: &mut PreprocessedRequest,

@@ -1768,6 +1768,8 @@ impl OpenAIPreprocessor {
             routing_token_ids: expanded,
             block_mm_infos: Vec::new(),
             expanded_prompt_len,
+            epd_prefill_selection: None,
+            epd_routing_plan: None,
         }));
         Ok(())
     }

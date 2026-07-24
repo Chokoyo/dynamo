@@ -71,6 +71,7 @@ from dynamo.llm import (
     ModelInput,
     ModelRuntimeConfig,
     ModelType,
+    MultimodalEmbeddingCachePublisher,
     WorkerType,
     lora_name_to_id,
     register_model,
@@ -90,6 +91,7 @@ from .constants import DisaggregationMode, EmbeddingTransferMode
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.async_vision_encoder import AsyncVisionEncoder
 from .multimodal_utils.embed_assembler import build_mixed_embeds
+from .multimodal_utils.epd_embedding_bridge import VllmEpdEmbeddingBridge
 from .multimodal_utils.prefill_worker_utils import MultiModalEmbeddingLoader
 from .multimodal_utils.request_processor import (
     IMAGE_URL_KEY,
@@ -997,6 +999,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Optional[Client] = None,
+        embedding_cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         self.runtime = runtime
         self.engine_client = engine
@@ -1022,7 +1025,27 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self._paused: bool = False
         self._weight_version: str = "initial"
 
-        embedding_loader = self.init_embedding_loader(config, encode_worker_client)
+        transfer_config = getattr(engine.vllm_config, "ec_transfer_config", None)
+        extra_config = getattr(transfer_config, "ec_connector_extra_config", None) or {}
+        epd_bridge_dir = extra_config.get("epd_bridge_dir")
+        use_epd_bridge = bool(
+            config.route_to_encoder
+            and encode_worker_client is not None
+            and epd_bridge_dir
+        )
+
+        embedding_loader = self.init_embedding_loader(
+            config,
+            encode_worker_client,
+            None if use_epd_bridge else embedding_cache_publisher,
+        )
+        self._epd_embedding_bridge: VllmEpdEmbeddingBridge | None = None
+        if use_epd_bridge and embedding_loader is not None:
+            self._epd_embedding_bridge = VllmEpdEmbeddingBridge(
+                epd_bridge_dir,
+                embedding_loader,
+                embedding_cache_publisher,
+            )
 
         # Aggregated partial encoder. The attribute is set here so cleanup() is
         # always safe; the encoder itself is loaded last in __init__ (it starts
@@ -1046,6 +1069,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             enable_multimodal=enable_multimodal,
             enable_frontend_decoding=enable_frontend_decoding,
             embedding_loader=embedding_loader,
+            epd_embedding_bridge=self._epd_embedding_bridge,
             trust_remote_code=config.engine_args.trust_remote_code,
         )
 
@@ -1130,7 +1154,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self._shutdown_worker()
 
     def init_embedding_loader(
-        self, config: Config, encode_worker_client: Optional[Client] = None
+        self,
+        config: Config,
+        encode_worker_client: Optional[Client] = None,
+        cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ) -> Optional[MultiModalEmbeddingLoader]:
         """Initialize the embedding loader with the given encode worker client."""
         # Without encode worker, the embedding will be generated internally by vLLM.
@@ -1178,6 +1205,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             encode_worker_client=self.encode_worker_client,  # type: ignore
             receiver=self.embedding_receiver,
             embedding_cache_manager=self.embedding_cache_manager,
+            cache_publisher=cache_publisher,
         )
 
     async def sleep(self, body: dict) -> dict:
@@ -2473,6 +2501,8 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
     def cleanup(self):
         """Clean up resources including temporary directories."""
+        if self._epd_embedding_bridge is not None:
+            self._epd_embedding_bridge.cancel()
         if self._custom_encoder is not None:
             # Run backend.close() on the actor thread, then stop it — executor
             # GC would only end the thread, never call close().
@@ -2802,9 +2832,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 for output in res.outputs:
                     output_idx = getattr(output, "index", 0) or 0
                     token_ids = list(output.token_ids or [])
-                    total_output_tokens_by_index[
-                        output_idx
-                    ] = total_output_tokens_by_index.get(output_idx, 0) + len(token_ids)
+                    total_output_tokens_by_index[output_idx] = (
+                        total_output_tokens_by_index.get(output_idx, 0) + len(token_ids)
+                    )
                     finish_reason = getattr(output, "finish_reason", None)
                     stop_reason = getattr(output, "stop_reason", None)
                     if not token_ids and not finish_reason and not stop_reason:
@@ -2844,11 +2874,11 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
                     if finish_reason:
                         out["finish_reason"] = normalize_finish_reason(finish_reason)
-                        out[
-                            "completion_usage"
-                        ] = BaseWorkerHandler._build_completion_usage(
-                            request_output=res,
-                            completion_token_counts=total_output_tokens_by_index,
+                        out["completion_usage"] = (
+                            BaseWorkerHandler._build_completion_usage(
+                                request_output=res,
+                                completion_token_counts=total_output_tokens_by_index,
+                            )
                         )
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
@@ -2892,6 +2922,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
+        finally:
+            if self._epd_embedding_bridge is not None:
+                await self._epd_embedding_bridge.unregister(request_id)
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):
@@ -2909,6 +2942,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Client | None = None,
+        embedding_cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         super().__init__(
             runtime,
@@ -2923,6 +2957,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             shutdown_event=shutdown_event,
             enable_frontend_decoding=enable_frontend_decoding,
             encode_worker_client=encode_worker_client,
+            embedding_cache_publisher=embedding_cache_publisher,
         )
 
     async def generate(self, request, context):
@@ -3218,9 +3253,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         if abort_guard is not None:
                             abort_guard.signal_first_token()
                         if prefill_result is not None and "completion_usage" in tok:
-                            tok["completion_usage"][
-                                "prompt_tokens_details"
-                            ] = prefill_prompt_tokens_details
+                            tok["completion_usage"]["prompt_tokens_details"] = (
+                                prefill_prompt_tokens_details
+                            )
 
                         if want_engine_data:
                             _accumulate_engine_data(
@@ -3269,14 +3304,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # the unsafe pre-first-token window, and the admin abort_request route can
         # reach this request via self._deferred_aborts.
         is_decode_only = self.config.disaggregation_mode == DisaggregationMode.DECODE
-        async with _deferred_abort_guard(
-            self.engine_client,
-            request_id,
-            is_decode_only,
-            self._deferred_aborts,
-            self._shutdown_on_engine_dead,
-        ) as abort_guard, self._abort_monitor(
-            context, request_id, abort_guard=abort_guard
+        async with (
+            _deferred_abort_guard(
+                self.engine_client,
+                request_id,
+                is_decode_only,
+                self._deferred_aborts,
+                self._shutdown_on_engine_dead,
+            ) as abort_guard,
+            self._abort_monitor(context, request_id, abort_guard=abort_guard),
         ):
             try:
                 gen = self.engine_client.generate(
@@ -3362,6 +3398,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Client | None = None,
+        embedding_cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         super().__init__(
             runtime,
@@ -3376,6 +3413,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             shutdown_event=shutdown_event,
             enable_frontend_decoding=enable_frontend_decoding,
             encode_worker_client=encode_worker_client,
+            embedding_cache_publisher=embedding_cache_publisher,
         )
 
         self._multimodal_request_processor.initialize_prefill_handoff()
@@ -3396,9 +3434,15 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             return
 
         # Token-in-token-out mode: internal protocol format
-        with time_and_log_code_section(f"[PREFILL] request: {request_id} generate"):
-            async for chunk in self._generate_token_mode(request, context, request_id):
-                yield chunk
+        try:
+            with time_and_log_code_section(f"[PREFILL] request: {request_id} generate"):
+                async for chunk in self._generate_token_mode(
+                    request, context, request_id
+                ):
+                    yield chunk
+        finally:
+            if self._epd_embedding_bridge is not None:
+                await self._epd_embedding_bridge.unregister(request_id)
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
@@ -3443,9 +3487,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         )
         if sampling_params.extra_args is None:
             sampling_params.extra_args = {}
-        sampling_params.extra_args[
-            "kv_transfer_params"
-        ] = kv_protocol.prefill_request_kv_transfer_params()
+        sampling_params.extra_args["kv_transfer_params"] = (
+            kv_protocol.prefill_request_kv_transfer_params()
+        )
         # Override for prefill: only generate 1 token
         sampling_params.max_tokens = 1
         sampling_params.min_tokens = 1
@@ -3543,9 +3587,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         if embedding_params is not None:
             disaggregated_params["embedding_params"] = embedding_params
         if expanded_prompt_token_ids is not None:
-            disaggregated_params[
-                "expanded_prompt_token_ids"
-            ] = expanded_prompt_token_ids
+            disaggregated_params["expanded_prompt_token_ids"] = (
+                expanded_prompt_token_ids
+            )
 
         return disaggregated_params if disaggregated_params else None
 

@@ -24,7 +24,13 @@ from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
     register_embedding_cache_metrics,
 )
-from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
+from dynamo.llm import (
+    ModelInput,
+    ModelType,
+    MultimodalEmbeddingCachePublisher,
+    WorkerType,
+    register_model,
+)
 from dynamo.runtime import DistributedRuntime
 
 from .args import Config
@@ -612,9 +618,18 @@ class WorkerFactory:
         )
         shutdown_endpoints[:] = [generate_endpoint]
 
+        cache_publisher = None
+        if (
+            config.multimodal_embedding_cache_capacity_gb > 0
+            and config.multimodal_embedding_cache_publisher
+        ):
+            cache_publisher = MultimodalEmbeddingCachePublisher()
+            await cache_publisher.create_endpoint(generate_endpoint)
+
         handler = EncodeWorkerHandler(
             config.engine_args,
             config.embedding_transfer_mode,  # type: ignore[arg-type]
+            cache_publisher,
         )
         await handler.async_init(runtime)
 
@@ -1193,6 +1208,14 @@ class WorkerFactory:
             runtime, config
         )
 
+        cache_publisher = None
+        if (
+            config.multimodal_embedding_cache_capacity_gb > 0
+            and config.multimodal_embedding_cache_publisher
+        ):
+            cache_publisher = MultimodalEmbeddingCachePublisher()
+            await cache_publisher.create_endpoint(generate_endpoint)
+
         handler = PrefillWorkerHandler(
             runtime,
             config,
@@ -1206,6 +1229,7 @@ class WorkerFactory:
             shutdown_event=shutdown_event,
             enable_frontend_decoding=config.frontend_decoding,
             encode_worker_client=encode_worker_client,
+            embedding_cache_publisher=cache_publisher,
         )
         handler.add_temp_dir(prometheus_temp_dir)
 

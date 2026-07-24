@@ -111,6 +111,10 @@ pub struct KvPushRouter {
 }
 
 impl KvPushRouter {
+    pub(crate) fn client(&self) -> &dynamo_runtime::component::Client {
+        &self.inner.client
+    }
+
     pub fn new(
         inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
         chooser: Arc<KvRouter>,

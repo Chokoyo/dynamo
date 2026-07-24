@@ -35,6 +35,7 @@ from dynamo.common.multimodal.video_loader import VideoLoader
 from dynamo.common.utils import nvtx_utils as _nvtx
 
 from .hash_utils import compute_mm_uuids_from_images
+from .epd_embedding_bridge import VllmEpdEmbeddingBridge
 from .model import ModelFamily, construct_qwen_decode_mm_data, resolve_model_family
 from .models.qwen import (
     QwenGridParams,
@@ -269,6 +270,7 @@ class VllmMultimodalRequestProcessor:
         enable_multimodal: bool = False,
         enable_frontend_decoding: bool = False,
         embedding_loader: Any = None,
+        epd_embedding_bridge: VllmEpdEmbeddingBridge | None = None,
         image_loader: Optional[ImageLoader] = None,
         video_loader: Optional[VideoLoader] = None,
         audio_loader: Optional[AudioLoader] = None,
@@ -280,6 +282,7 @@ class VllmMultimodalRequestProcessor:
         self.enable_multimodal = enable_multimodal
         self.trust_remote_code = trust_remote_code
         self.embedding_loader = embedding_loader
+        self.epd_embedding_bridge = epd_embedding_bridge
         self.image_loader = image_loader or ImageLoader(
             enable_frontend_decoding=enable_frontend_decoding
         )
@@ -387,14 +390,53 @@ class VllmMultimodalRequestProcessor:
                     else:
                         supported = False
                 if supported:
-                    vllm_mm_data = (
-                        await self.embedding_loader.load_multimodal_embeddings(
-                            image_urls,
-                            request_id,
-                            model=self.model,
-                            context=context,
-                        )
+                    routing_info = request.get("mm_routing_info")
+                    selection = (
+                        routing_info.get("epd_prefill_selection")
+                        if isinstance(routing_info, dict)
+                        else None
                     )
+                    routing_plan = (
+                        routing_info.get("epd_routing_plan")
+                        if isinstance(routing_info, dict)
+                        and isinstance(selection, dict)
+                        and selection.get("mode") == "enforce"
+                        else None
+                    )
+                    identifiers = self._get_image_identifiers(request)
+                    bridge_registered = False
+                    if (
+                        routing_plan is not None
+                        and self.epd_embedding_bridge is not None
+                        and identifiers is not None
+                        and len(identifiers) == len(image_urls)
+                    ):
+                        try:
+                            await self.epd_embedding_bridge.register(
+                                request_id=request_id,
+                                image_urls=image_urls,
+                                identifiers=identifiers,
+                                model=self.model,
+                                routing_plan=routing_plan,
+                                context=context,
+                            )
+                            bridge_registered = True
+                        except Exception:
+                            logger.warning(
+                                "Failed to register vLLM post-KV EPD fetch; "
+                                "falling back to eager embedding resolution",
+                                exc_info=True,
+                            )
+                    if not bridge_registered:
+                        vllm_mm_data = (
+                            await self.embedding_loader.load_multimodal_embeddings(
+                                image_urls,
+                                request_id,
+                                model=self.model,
+                                routing_plan=routing_plan,
+                                context=context,
+                            )
+                        )
 
             image_items = mm_map.get(IMAGE_URL_KEY, [])
             image_key = "vision_chunk" if self.use_unified_vision_chunk else "image"
@@ -479,6 +521,27 @@ class VllmMultimodalRequestProcessor:
             return vllm_mm_data or None
         finally:
             _nvtx.end_range(rng)
+
+    def _get_image_identifiers(self, request: dict[str, Any]) -> list[str] | None:
+        extra_args = request.get("extra_args") or {}
+        mm_uuids = _build_user_mm_uuids(
+            request.get("multi_modal_uuids"),
+            self.use_unified_vision_chunk,
+        )
+        if mm_uuids is None:
+            mm_uuids = _build_forwarded_mm_uuids(
+                extra_args,
+                self.use_unified_vision_chunk,
+            )
+        if mm_uuids is None:
+            return None
+        modality = "vision_chunk" if self.use_unified_vision_chunk else "image"
+        values = mm_uuids.get(modality)
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) and value for value in values
+        ):
+            return None
+        return list(values)
 
     async def try_receive_mm_kwargs(
         self, request: dict[str, Any]

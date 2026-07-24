@@ -176,6 +176,13 @@ class MultimodalEmbeddingCacheManager:
         added_keys = [] if key_already_present else [key]
         return CacheMutation(True, added_keys, removed_keys)
 
+    def clear_with_delta(self) -> CacheMutation:
+        """Clear the cache and return the authoritative removal delta."""
+        removed_keys = list(self._cache)
+        self._cache.clear()
+        self._current_bytes = 0
+        return CacheMutation(True, [], removed_keys)
+
     @property
     def stats(self) -> dict:
         """
