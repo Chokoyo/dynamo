@@ -50,8 +50,12 @@ from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
 )
 from dynamo.common.multimodal.embedding_transfer import (
+    AbstractEmbeddingSender,
+    LocalEmbeddingSender,
     LocalEmbeddingReceiver,
+    NixlReadEmbeddingSender,
     NixlReadEmbeddingReceiver,
+    NixlWriteEmbeddingSender,
     NixlWriteEmbeddingReceiver,
 )
 from dynamo.common.rl import (
@@ -91,8 +95,10 @@ from .constants import DisaggregationMode, EmbeddingTransferMode
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.async_vision_encoder import AsyncVisionEncoder
 from .multimodal_utils.embed_assembler import build_mixed_embeds
+from .multimodal_utils.encode_utils import get_embedding_hash
 from .multimodal_utils.epd_embedding_bridge import VllmEpdEmbeddingBridge
 from .multimodal_utils.prefill_worker_utils import MultiModalEmbeddingLoader
+from .multimodal_utils.protocol import vLLMMultimodalRequest
 from .multimodal_utils.request_processor import (
     IMAGE_URL_KEY,
     URL_VARIANT_KEY,
@@ -999,6 +1005,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Optional[Client] = None,
+        prefill_worker_client: Optional[Client] = None,
         embedding_cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         self.runtime = runtime
@@ -1037,8 +1044,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         embedding_loader = self.init_embedding_loader(
             config,
             encode_worker_client,
+            prefill_worker_client,
             None if use_epd_bridge else embedding_cache_publisher,
         )
+        self._embedding_loader = embedding_loader
         self._epd_embedding_bridge: VllmEpdEmbeddingBridge | None = None
         if use_epd_bridge and embedding_loader is not None:
             self._epd_embedding_bridge = VllmEpdEmbeddingBridge(
@@ -1157,6 +1166,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self,
         config: Config,
         encode_worker_client: Optional[Client] = None,
+        prefill_worker_client: Optional[Client] = None,
         cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ) -> Optional[MultiModalEmbeddingLoader]:
         """Initialize the embedding loader with the given encode worker client."""
@@ -1206,6 +1216,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             receiver=self.embedding_receiver,
             embedding_cache_manager=self.embedding_cache_manager,
             cache_publisher=cache_publisher,
+            prefill_worker_client=prefill_worker_client,
         )
 
     async def sleep(self, body: dict) -> dict:
@@ -2922,11 +2933,6 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
-        finally:
-            if self._epd_embedding_bridge is not None:
-                await self._epd_embedding_bridge.unregister(request_id)
-
-
 class DecodeWorkerHandler(BaseWorkerHandler):
     def __init__(
         self,
@@ -3398,6 +3404,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Client | None = None,
+        prefill_worker_client: Client | None = None,
         embedding_cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     ):
         super().__init__(
@@ -3413,10 +3420,95 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             shutdown_event=shutdown_event,
             enable_frontend_decoding=enable_frontend_decoding,
             encode_worker_client=encode_worker_client,
+            prefill_worker_client=prefill_worker_client,
             embedding_cache_publisher=embedding_cache_publisher,
         )
 
         self._multimodal_request_processor.initialize_prefill_handoff()
+        self._embedding_sender = (
+            self._create_embedding_sender(config.embedding_transfer_mode)
+            if self._embedding_loader is not None
+            else None
+        )
+        self._embedding_send_complete_queue: asyncio.Queue[tuple[Any, Any]] | None = (
+            asyncio.Queue() if self._embedding_sender is not None else None
+        )
+        self._embedding_send_complete_task = (
+            asyncio.create_task(self._check_embedding_send_complete())
+            if self._embedding_send_complete_queue is not None
+            else None
+        )
+
+    @staticmethod
+    def _create_embedding_sender(
+        transfer_mode: EmbeddingTransferMode,
+    ) -> AbstractEmbeddingSender:
+        if transfer_mode == EmbeddingTransferMode.LOCAL:
+            return LocalEmbeddingSender()
+        if transfer_mode == EmbeddingTransferMode.NIXL_WRITE:
+            return NixlWriteEmbeddingSender()
+        if transfer_mode == EmbeddingTransferMode.NIXL_READ:
+            return NixlReadEmbeddingSender()
+        raise ValueError(f"Invalid embedding transfer mode: {transfer_mode}")
+
+    async def _check_embedding_send_complete(self) -> None:
+        assert self._embedding_send_complete_queue is not None
+        while True:
+            transfer_future, embedding = await self._embedding_send_complete_queue.get()
+            if transfer_future is None:
+                self._embedding_send_complete_queue.task_done()
+                return
+            await transfer_future
+            self._embedding_send_complete_queue.task_done()
+
+    async def fetch_cached_embeddings(self, request, context):
+        if not isinstance(request, vLLMMultimodalRequest):
+            if isinstance(request, str):
+                request = vLLMMultimodalRequest.model_validate_json(request)
+            else:
+                request = vLLMMultimodalRequest.model_validate(request)
+        if self._embedding_loader is None:
+            raise RuntimeError("prefill embedding cache is unavailable")
+        if (
+            self._embedding_sender is None
+            or self._embedding_send_complete_queue is None
+        ):
+            raise RuntimeError("prefill embedding transfer is unavailable")
+        if not request.multimodal_inputs:
+            raise ValueError("multimodal_inputs must not be empty")
+
+        cached_items = []
+        for group in request.multimodal_inputs:
+            multimodal_input = group.multimodal_input
+            image_url = (
+                multimodal_input.image_url if multimodal_input is not None else None
+            )
+            if not image_url:
+                raise ValueError("image_url is required for prefill embedding fetch")
+            cache_key = get_embedding_hash(image_url)
+            cached = self._embedding_loader.get_cached_embedding(cache_key)
+            if cached is None:
+                raise KeyError(f"prefill embedding cache miss for key {cache_key}")
+            cached_items.append(cached)
+
+        transfers = await asyncio.gather(
+            *(
+                self._embedding_sender.send_embeddings(
+                    cached.tensor, stage_embeddings=True
+                )
+                for cached in cached_items
+            )
+        )
+        for group, cached, (transfer_request, transfer_future) in zip(
+            request.multimodal_inputs, cached_items, transfers, strict=True
+        ):
+            group.image_grid_thw = cached.image_grid_thw
+            group.embeddings_shape = tuple(cached.tensor.shape)
+            group.serialized_request = transfer_request
+            self._embedding_send_complete_queue.put_nowait(
+                (transfer_future, cached.tensor)
+            )
+        yield request.model_dump_json()
 
     async def generate(self, request, context):
         # Use context ID for request tracking and correlation with decode phase
@@ -3443,6 +3535,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         finally:
             if self._epd_embedding_bridge is not None:
                 await self._epd_embedding_bridge.unregister(request_id)
+
+    def cleanup(self):
+        if self._embedding_send_complete_queue is not None:
+            self._embedding_send_complete_queue.put_nowait((None, None))
+        super().cleanup()
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
@@ -3553,7 +3650,6 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         mm_processor_kwargs=mm_processor_kwargs,
                     )
                 )
-
                 output: Dict[str, Any] = {
                     "token_ids": list(token_ids),
                     "disaggregated_params": self._build_disaggregated_params(

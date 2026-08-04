@@ -26,6 +26,7 @@ class ResidencyAction(str, Enum):
 
 class MMSourceKind(str, Enum):
     P_LOCAL = "P_LOCAL"
+    P_REMOTE = "P_REMOTE"
     E_CACHE = "E_CACHE"
     E_COMPUTE = "E_COMPUTE"
 
@@ -360,11 +361,16 @@ class JointMMPlanner:
             (candidate.worker_id, candidate.worker_generation): candidate
             for candidate in healthy_e
         }
+        prefills_by_worker = {
+            (candidate.worker_id, candidate.worker_generation): candidate
+            for candidate in healthy_p
+        }
 
         plans = [
             self._plan_for_prefill(
                 objects=objects,
                 prefill=candidate,
+                prefills_by_worker=prefills_by_worker,
                 encoders_by_worker=encoders_by_worker,
                 locations_by_key=locations_by_key,
             )
@@ -380,6 +386,7 @@ class JointMMPlanner:
         *,
         objects: Sequence[MMObjectRef],
         prefill: PrefillCandidate,
+        prefills_by_worker: Mapping[tuple[int, int], PrefillCandidate],
         encoders_by_worker: Mapping[tuple[int, int], EncodeCandidate],
         locations_by_key: Mapping[str, tuple[CacheLocation, ...]],
     ) -> MMRoutingPlan:
@@ -415,32 +422,47 @@ class JointMMPlanner:
                 encode_saved_ms += self._config.local_ec_saved_encode_ms
                 continue
 
-            remote_options: list[tuple[float, CacheLocation]] = []
+            remote_options: list[tuple[float, MMSourceKind, CacheLocation]] = []
             for location in locations:
-                if location.worker_role is not WorkerRole.ENCODE:
-                    continue
-                encoder = encoders_by_worker.get(
-                    (location.worker_id, location.worker_generation)
-                )
-                if encoder is None:
-                    continue
-                remote_cost = (
-                    encoder.queue_delay_ms
-                    + self._config.remote_transfer_fixed_ms
-                    + location.bytes / self._config.remote_bandwidth_bytes_per_ms
-                )
-                remote_options.append((remote_cost, location))
+                if location.worker_role is WorkerRole.PREFILL:
+                    remote_prefill = prefills_by_worker.get(
+                        (location.worker_id, location.worker_generation)
+                    )
+                    if (
+                        remote_prefill is None
+                        or location.worker_id == prefill.worker_id
+                    ):
+                        continue
+                    remote_cost = (
+                        self._config.remote_transfer_fixed_ms
+                        + location.bytes / self._config.remote_bandwidth_bytes_per_ms
+                    )
+                    remote_options.append(
+                        (remote_cost, MMSourceKind.P_REMOTE, location)
+                    )
+                elif location.worker_role is WorkerRole.ENCODE:
+                    encoder = encoders_by_worker.get(
+                        (location.worker_id, location.worker_generation)
+                    )
+                    if encoder is None:
+                        continue
+                    remote_cost = (
+                        encoder.queue_delay_ms
+                        + self._config.remote_transfer_fixed_ms
+                        + location.bytes / self._config.remote_bandwidth_bytes_per_ms
+                    )
+                    remote_options.append((remote_cost, MMSourceKind.E_CACHE, location))
 
             if remote_options:
-                remote_cost, location = min(
-                    remote_options, key=lambda item: (item[0], item[1].worker_id)
+                remote_cost, source_kind, location = min(
+                    remote_options, key=lambda item: (item[0], item[2].worker_id)
                 )
                 selected_remote_workers.add(location.worker_id)
                 transfer_ms += remote_cost
                 object_plans.append(
                     MMObjectPlan(
                         obj.object_index,
-                        MMSourceKind.E_CACHE,
+                        source_kind,
                         location.worker_id,
                         location.worker_generation,
                         remote_cost,
@@ -478,6 +500,9 @@ class JointMMPlanner:
         fanout_penalty = max(0, len(selected_remote_workers) - 1) * (
             self._config.fanout_penalty_ms
         )
+        # TODO: Ablate each heuristic score component independently before choosing
+        # production defaults. Calibrate the weights from measured TTFT and verify
+        # which terms improve routing beyond KV overlap plus projected prefill cost.
         predicted_benefit = (
             prefill.predicted_saved_prefill_ms
             + encode_saved_ms

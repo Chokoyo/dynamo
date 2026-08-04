@@ -1207,6 +1207,16 @@ class WorkerFactory:
         encode_worker_client = await self._maybe_get_encode_worker_client(
             runtime, config
         )
+        embedding_fetch_endpoint = None
+        prefill_worker_client = None
+        if (
+            config.route_to_encoder
+            and config.multimodal_embedding_cache_capacity_gb > 0
+        ):
+            embedding_fetch_endpoint = runtime.endpoint(
+                f"{config.namespace}.{config.component}.embedding_fetch"
+            )
+            prefill_worker_client = await embedding_fetch_endpoint.client()
 
         cache_publisher = None
         if (
@@ -1229,6 +1239,7 @@ class WorkerFactory:
             shutdown_event=shutdown_event,
             enable_frontend_decoding=config.frontend_decoding,
             encode_worker_client=encode_worker_client,
+            prefill_worker_client=prefill_worker_client,
             embedding_cache_publisher=cache_publisher,
         )
         handler.add_temp_dir(prometheus_temp_dir)
@@ -1295,6 +1306,8 @@ class WorkerFactory:
             f"{config.namespace}.{config.component}.get_perf_metrics"
         )
         shutdown_endpoints[:] = [generate_endpoint, clear_endpoint, perf_endpoint]
+        if embedding_fetch_endpoint is not None:
+            shutdown_endpoints.append(embedding_fetch_endpoint)
         if rl_endpoint is not None:
             shutdown_endpoints.append(rl_endpoint)
         if lora_enabled:
@@ -1367,6 +1380,13 @@ class WorkerFactory:
                     metrics_labels=prefill_metrics_labels,
                 ),
             ]
+            if embedding_fetch_endpoint is not None:
+                serve_tasks.append(
+                    embedding_fetch_endpoint.serve_endpoint(
+                        handler.fetch_cached_embeddings,
+                        metrics_labels=prefill_metrics_labels,
+                    )
+                )
             if rl_endpoint is not None:
                 serve_tasks.append(
                     rl_endpoint.serve_endpoint(

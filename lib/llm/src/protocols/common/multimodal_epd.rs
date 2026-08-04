@@ -49,6 +49,7 @@ pub enum ObjectSourceKind {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MmSourceKind {
     PLocal,
+    PRemote,
     ECache,
     ECompute,
 }

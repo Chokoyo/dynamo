@@ -64,12 +64,21 @@ class _PendingRelease:
             self._receiver.release_tensor(tid)
         self._tensor_ids.clear()
 
+    def merge(self, other: "_PendingRelease | None") -> None:
+        if other is None:
+            return
+        if other._receiver is not self._receiver:
+            raise ValueError("cannot merge pending releases from different receivers")
+        self._tensor_ids.extend(other._tensor_ids)
+        other._tensor_ids.clear()
+
 
 def _parse_object_plans(
     routing_plan: Mapping[str, Any] | None,
     *,
     object_count: int,
-    available_worker_ids: set[int],
+    available_encode_worker_ids: set[int],
+    available_prefill_worker_ids: set[int],
 ) -> tuple[MMObjectPlan, ...] | None:
     """Validate an enforced object plan or return ``None`` for legacy routing."""
     if routing_plan is None:
@@ -91,9 +100,14 @@ def _parse_object_plans(
             worker_generation = int(raw["source_worker_generation"])
             if worker_generation < 0:
                 raise ValueError("worker generation must be non-negative")
-            if (
+            if source_kind is MMSourceKind.P_REMOTE:
+                if worker_id not in available_prefill_worker_ids:
+                    raise ValueError(
+                        f"planned prefill worker {worker_id} is unavailable"
+                    )
+            elif (
                 source_kind is not MMSourceKind.P_LOCAL
-                and worker_id not in available_worker_ids
+                and worker_id not in available_encode_worker_ids
             ):
                 raise ValueError(f"planned encode worker {worker_id} is unavailable")
             plans.append(
@@ -191,6 +205,8 @@ async def _fetch_from_encode_workers(
     receiver: AbstractEmbeddingReceiver,
     object_plans: Sequence[MMObjectPlan] | None = None,
     context=None,
+    worker_label: str = "encode",
+    retry_alternate_worker: bool = True,
 ) -> tuple[List[MultiModalGroup], _PendingRelease | None]:
     """Fan out image URLs to encode workers, load embeddings, and return ready groups.
 
@@ -201,7 +217,7 @@ async def _fetch_from_encode_workers(
     encode_worker_ids = encode_worker_client.instance_ids()
     encode_worker_count = len(encode_worker_ids)
     if encode_worker_count == 0:
-        raise RuntimeError("No encode workers available to process multimodal input")
+        raise RuntimeError(f"No {worker_label} workers available for multimodal input")
     if object_plans is not None and len(object_plans) != len(image_urls):
         raise ValueError("object plan count must match the number of image URLs")
 
@@ -287,7 +303,7 @@ async def _fetch_from_encode_workers(
             for index, plan in enumerate(object_plans):
                 if plan.source_kind is MMSourceKind.P_LOCAL:
                     raise ValueError(
-                        "P_LOCAL object cannot be dispatched to an encode worker"
+                        f"P_LOCAL object cannot be dispatched to a {worker_label} worker"
                     )
                 by_worker[plan.source_worker_id].append(index)
             dispatches = [
@@ -311,15 +327,18 @@ async def _fetch_from_encode_workers(
             if isinstance(collected, BaseException):
                 if worker_id is None:
                     raise collected
+                if not retry_alternate_worker:
+                    raise collected
                 retry_worker_id = alternate_worker(worker_id)
                 logger.warning(
-                    "Planned multimodal encode worker %s failed validation for request "
+                    "Planned multimodal %s worker %s failed validation for request "
                     "%s; retrying %s object(s) via %s",
+                    worker_label,
                     worker_id,
                     request_id,
                     len(indices),
                     (
-                        f"encode worker {retry_worker_id}"
+                        f"{worker_label} worker {retry_worker_id}"
                         if retry_worker_id is not None
                         else "legacy round-robin routing"
                     ),
@@ -356,6 +375,28 @@ async def _fetch_from_encode_workers(
     return multimodal_groups, pending
 
 
+async def _fetch_from_prefill_workers(
+    prefill_worker_client: Client,
+    image_urls: List[str],
+    request_id: str,
+    receiver: AbstractEmbeddingReceiver,
+    object_plans: Sequence[MMObjectPlan],
+    context=None,
+) -> tuple[List[MultiModalGroup], _PendingRelease | None]:
+    if any(plan.source_kind is not MMSourceKind.P_REMOTE for plan in object_plans):
+        raise ValueError("prefill fetch only accepts P_REMOTE object plans")
+    return await _fetch_from_encode_workers(
+        prefill_worker_client,
+        image_urls,
+        request_id,
+        receiver,
+        object_plans=object_plans,
+        context=context,
+        worker_label="prefill embedding-fetch",
+        retry_alternate_worker=False,
+    )
+
+
 async def _fetch_embeddings(
     encode_worker_client: Client,
     image_urls: list[str],
@@ -364,6 +405,7 @@ async def _fetch_embeddings(
     cache: MultimodalEmbeddingCacheManager | None = None,
     cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
     routing_plan: Mapping[str, Any] | None = None,
+    prefill_worker_client: Client | None = None,
     context=None,
 ) -> tuple[list[MultiModalGroup], _PendingRelease | None]:
     """Fetch multimodal embeddings with transparent cache-through.
@@ -380,14 +422,18 @@ async def _fetch_embeddings(
         _parse_object_plans(
             routing_plan,
             object_count=len(image_urls),
-            available_worker_ids=set(encode_worker_client.instance_ids()),
+            available_encode_worker_ids=set(encode_worker_client.instance_ids()),
+            available_prefill_worker_ids=(
+                set(prefill_worker_client.instance_ids())
+                if prefill_worker_client is not None
+                else set()
+            ),
         )
         if routing_plan is not None
         else None
     )
     results: list[MultiModalGroup | None] = [None] * len(image_urls)
     to_fetch: list[tuple[int, str, str | None, MMObjectPlan | None]] = []
-    stale_local_plan = False
 
     # ── 1. Check cache (no-op when cache is None) ────────────────────
     for idx, url in enumerate(image_urls):
@@ -405,59 +451,124 @@ async def _fetch_embeddings(
             key = None
         object_plan = object_plans[idx] if object_plans is not None else None
         if object_plan is not None and object_plan.source_kind is MMSourceKind.P_LOCAL:
-            stale_local_plan = True
+            logger.warning(
+                "Planned P-local embedding is absent for request %s object %s; "
+                "falling back to encode routing",
+                request_id,
+                idx,
+            )
+            object_plan = None
         to_fetch.append((idx, url, key, object_plan))
 
-    if stale_local_plan:
-        logger.warning(
-            "Ignoring stale multimodal EPD plan for request %s: planned P-local "
-            "embedding is absent",
-            request_id,
-        )
-        object_plans = None
-        to_fetch = [(idx, url, key, None) for idx, url, key, _ in to_fetch]
-
-    # ── 2. Fetch uncached from encode workers ────────────────────────
+    # ── 2. Fetch uncached from planned P/E sources ───────────────────
     pending: _PendingRelease | None = None
     if to_fetch:
-        miss_urls = [url for _, url, _, _ in to_fetch]
-        miss_plans = (
-            [plan for _, _, _, plan in to_fetch if plan is not None]
-            if object_plans is not None
-            else None
-        )
-        groups, pending = await _fetch_from_encode_workers(
-            encode_worker_client,
-            miss_urls,
-            request_id,
-            receiver,
-            object_plans=miss_plans,
-            context=context,
-        )
+        p_remote = [
+            item
+            for item in to_fetch
+            if item[3] is not None and item[3].source_kind is MMSourceKind.P_REMOTE
+        ]
+        planned_encode = [
+            item
+            for item in to_fetch
+            if item[3] is not None
+            and item[3].source_kind in (MMSourceKind.E_CACHE, MMSourceKind.E_COMPUTE)
+        ]
+        legacy_encode = [item for item in to_fetch if item[3] is None]
 
-        # ── 3. Update cache (no-op when cache is None) ──────────────
+        async def store_groups(
+            entries: list[tuple[int, str, str | None, MMObjectPlan | None]],
+            groups: list[MultiModalGroup],
+            fetched_pending: _PendingRelease | None,
+        ) -> None:
+            nonlocal pending
+            if pending is None:
+                pending = fetched_pending
+            elif fetched_pending is not None:
+                pending.merge(fetched_pending)
+            for (idx, _url, key, _plan), group in zip(entries, groups, strict=True):
+                if cache is not None and key is not None:
+                    assert group.loaded_embedding is not None
+                    mutation = cache.set_with_delta(
+                        key,
+                        CachedEmbedding(
+                            tensor=group.loaded_embedding.clone(),
+                            image_grid_thw=group.image_grid_thw,
+                        ),
+                    )
+                    if cache_publisher is not None:
+                        try:
+                            cache_publisher.publish_delta(
+                                mutation.added_keys, mutation.removed_keys
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to publish vLLM prefill cache delta",
+                                exc_info=True,
+                            )
+                results[idx] = group
 
-        for (idx, _url, key, _plan), group in zip(to_fetch, groups, strict=True):
-            if cache is not None and key is not None:
-                assert group.loaded_embedding is not None
-                mutation = cache.set_with_delta(
-                    key,
-                    CachedEmbedding(
-                        tensor=group.loaded_embedding.clone(),
-                        image_grid_thw=group.image_grid_thw,
-                    ),
-                )
-                if cache_publisher is not None:
-                    try:
-                        cache_publisher.publish_delta(
-                            mutation.added_keys, mutation.removed_keys
+        if p_remote:
+            by_prefill_worker: dict[
+                int, list[tuple[int, str, str | None, MMObjectPlan | None]]
+            ] = defaultdict(list)
+            for entry in p_remote:
+                plan = entry[3]
+                assert plan is not None
+                by_prefill_worker[plan.source_worker_id].append(entry)
+
+            for source_worker_id, entries in by_prefill_worker.items():
+                try:
+                    if prefill_worker_client is None:
+                        raise RuntimeError(
+                            "prefill embedding-fetch client is unavailable"
                         )
-                    except Exception:
-                        logger.warning(
-                            "Failed to publish vLLM prefill cache delta",
-                            exc_info=True,
-                        )
-            results[idx] = group
+                    groups, fetched_pending = await _fetch_from_prefill_workers(
+                        prefill_worker_client,
+                        [url for _, url, _, _ in entries],
+                        request_id,
+                        receiver,
+                        [plan for _, _, _, plan in entries if plan is not None],
+                        context=context,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Remote prefill embedding fetch from worker %s failed for "
+                        "request %s; falling back to encode routing for %s object(s)",
+                        source_worker_id,
+                        request_id,
+                        len(entries),
+                        exc_info=True,
+                    )
+                    legacy_encode.extend(
+                        [(idx, url, key, None) for idx, url, key, _ in entries]
+                    )
+                else:
+                    await store_groups(entries, groups, fetched_pending)
+
+        if planned_encode:
+            groups, fetched_pending = await _fetch_from_encode_workers(
+                encode_worker_client,
+                [url for _, url, _, _ in planned_encode],
+                request_id,
+                receiver,
+                object_plans=[
+                    plan for _, _, _, plan in planned_encode if plan is not None
+                ],
+                context=context,
+            )
+            await store_groups(planned_encode, groups, fetched_pending)
+
+        if legacy_encode:
+            groups, fetched_pending = await _fetch_from_encode_workers(
+                encode_worker_client,
+                [url for _, url, _, _ in legacy_encode],
+                request_id,
+                receiver,
+                object_plans=None,
+                context=context,
+            )
+            await store_groups(legacy_encode, groups, fetched_pending)
 
     return [r for r in results if r is not None], pending
 
@@ -474,8 +585,10 @@ class MultiModalEmbeddingLoader:
         receiver: AbstractEmbeddingReceiver,
         embedding_cache_manager: MultimodalEmbeddingCacheManager | None = None,
         cache_publisher: MultimodalEmbeddingCachePublisher | None = None,
+        prefill_worker_client: Client | None = None,
     ):
         self._encode_worker_client = encode_worker_client
+        self._prefill_worker_client = prefill_worker_client
         self._receiver = receiver
         self._embedding_cache_manager = embedding_cache_manager
         self._cache_publisher = cache_publisher
@@ -500,6 +613,7 @@ class MultiModalEmbeddingLoader:
             cache=self._embedding_cache_manager,
             cache_publisher=self._cache_publisher,
             routing_plan=routing_plan,
+            prefill_worker_client=self._prefill_worker_client,
             context=context,
         )
         parts = []
@@ -543,6 +657,7 @@ class MultiModalEmbeddingLoader:
             cache=self._embedding_cache_manager,
             cache_publisher=self._cache_publisher,
             routing_plan=routing_plan,
+            prefill_worker_client=self._prefill_worker_client,
             context=context,
         )
 
@@ -569,3 +684,8 @@ class MultiModalEmbeddingLoader:
             pending.release_all()
 
         return multi_modal_data
+
+    def get_cached_embedding(self, cache_key: str) -> CachedEmbedding | None:
+        if self._embedding_cache_manager is None:
+            return None
+        return self._embedding_cache_manager.get(cache_key)

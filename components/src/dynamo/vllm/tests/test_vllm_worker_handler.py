@@ -19,9 +19,13 @@ import torch
 
 import dynamo.vllm.handlers as mod
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
+    CachedEmbedding,
     MultimodalEmbeddingCacheManager,
 )
+from dynamo.common.multimodal.embedding_transfer import TransferRequest
 from dynamo.vllm.multimodal_utils.protocol import (
+    MultiModalGroup,
+    MultiModalInput,
     PatchedTokensPrompt,
     vLLMMultimodalRequest,
 )
@@ -68,9 +72,7 @@ def _make_config(
     config.multimodal_embedding_cache_capacity_gb = (
         multimodal_embedding_cache_capacity_gb
     )
-    config.engine_args.create_model_config.return_value.get_diff_sampling_param.return_value = (
-        {}
-    )
+    config.engine_args.create_model_config.return_value.get_diff_sampling_param.return_value = {}
     return config
 
 
@@ -892,6 +894,55 @@ async def test_prefill_returns_structured_error_when_multimodal_is_disabled():
             "disaggregated_params": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_prefill_fetch_cached_embeddings_returns_transfer_metadata():
+    handler = mod.PrefillWorkerHandler.__new__(mod.PrefillWorkerHandler)
+    tensor = torch.ones((1, 2, 4), dtype=torch.float16)
+    cached = CachedEmbedding(tensor=tensor, image_grid_thw=[1, 2, 2])
+    handler._embedding_loader = SimpleNamespace(
+        get_cached_embedding=MagicMock(return_value=cached)
+    )
+    transfer_request = TransferRequest(
+        embeddings_shape=[1, 2, 4],
+        embedding_dtype_str="float16",
+        serialized_request=123,
+    )
+    transfer_future = asyncio.get_running_loop().create_future()
+    transfer_future.set_result(None)
+    handler._embedding_sender = SimpleNamespace(
+        send_embeddings=AsyncMock(return_value=(transfer_request, transfer_future))
+    )
+    handler._embedding_send_complete_queue = asyncio.Queue()
+    request = vLLMMultimodalRequest(
+        engine_prompt=PatchedTokensPrompt(prompt_token_ids=[]),
+        sampling_params=mod.SamplingParams(),
+        request_id="request-prefill-fetch",
+        multimodal_inputs=[
+            MultiModalGroup(
+                multimodal_input=MultiModalInput(image_url="http://image/1")
+            )
+        ],
+    )
+
+    chunks = [
+        chunk async for chunk in handler.fetch_cached_embeddings(request, MagicMock())
+    ]
+
+    assert len(chunks) == 1
+    response = vLLMMultimodalRequest.model_validate_json(chunks[0])
+    group = response.multimodal_inputs[0]
+    assert group.image_grid_thw == [1, 2, 2]
+    assert group.embeddings_shape == (1, 2, 4)
+    assert group.serialized_request == transfer_request
+    handler._embedding_loader.get_cached_embedding.assert_called_once()
+    handler._embedding_sender.send_embeddings.assert_awaited_once_with(
+        tensor, stage_embeddings=True
+    )
+    queued_future, queued_tensor = handler._embedding_send_complete_queue.get_nowait()
+    assert queued_future is transfer_future
+    assert queued_tensor is tensor
 
 
 # ── Deferred abort (disagg decode KV-transfer safety) tests ────────

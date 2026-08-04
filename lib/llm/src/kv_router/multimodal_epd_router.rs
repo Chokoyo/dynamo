@@ -285,6 +285,12 @@ impl MultimodalEpdRouter {
             let (source_kind, source_worker_id) =
                 if p_locations[object_index].contains(&target_p_worker_id) {
                     (MmSourceKind::PLocal, target_p_worker_id)
+                } else if let Some(worker_id) = Self::preferred_remote_prefill_worker(
+                    &p_locations[object_index],
+                    target_p_worker_id,
+                    &source_use_counts,
+                ) {
+                    (MmSourceKind::PRemote, worker_id)
                 } else if let Some(worker_id) =
                     Self::preferred_encode_worker(&e_locations[object_index], &source_use_counts)
                 {
@@ -331,6 +337,19 @@ impl MultimodalEpdRouter {
         })
     }
 
+    fn preferred_remote_prefill_worker(
+        workers: &[u64],
+        target_p_worker_id: u64,
+        source_use_counts: &HashMap<u64, usize>,
+    ) -> Option<u64> {
+        let remote_workers = workers
+            .iter()
+            .copied()
+            .filter(|worker_id| *worker_id != target_p_worker_id)
+            .collect::<Vec<_>>();
+        Self::preferred_encode_worker(&remote_workers, source_use_counts)
+    }
+
     fn score_plan(
         &self,
         candidate: &PrefillCandidateSnapshot,
@@ -370,7 +389,7 @@ impl MultimodalEpdRouter {
                     cache_hit_objects += 1;
                     0.0
                 }
-                MmSourceKind::ECache => {
+                MmSourceKind::PRemote | MmSourceKind::ECache => {
                     cache_hit_objects += 1;
                     remote_sources.insert(object.source_worker_id);
                     transfer_cost_ms += score_config.remote_transfer_ms;
@@ -385,6 +404,9 @@ impl MultimodalEpdRouter {
             };
         }
 
+        // TODO: Ablate each heuristic score component independently before choosing
+        // production defaults. Calibrate the weights from measured TTFT and verify
+        // which terms improve routing beyond KV overlap plus projected prefill cost.
         let kv_benefit_ms = candidate.cached_tokens as f64 * score_config.prefill_token_ms;
         let ec_saved_benefit_ms = cache_hit_objects as f64 * score_config.local_ec_saved_ms;
         let prefill_load_cost_ms = projected_prefill_ms * score_config.prefill_load_scale;
@@ -672,27 +694,34 @@ mod tests {
     }
 
     #[test]
-    fn plan_prefers_p_local_then_e_cache_then_e_compute() {
-        let cache_keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    fn plan_prefers_p_local_then_remote_p_then_e_cache_then_e_compute() {
+        let cache_keys = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
         let plan = MultimodalEpdRouter::build_plan_from_locations(
             &cache_keys,
             10,
             &[20, 21],
-            &[vec![10], vec![], vec![]],
-            &[vec![], vec![21], vec![]],
-            &[true, true, true],
+            &[vec![10], vec![12], vec![], vec![]],
+            &[vec![], vec![21], vec![21], vec![]],
+            &[true, true, true, true],
         )
         .unwrap();
 
         assert_eq!(plan.target_p_worker_id, 10);
         assert_eq!(plan.target_p_generation, 10);
-        assert_eq!(plan.objects.len(), 3);
+        assert_eq!(plan.objects.len(), 4);
         assert_eq!(plan.objects[0].source_kind, MmSourceKind::PLocal);
         assert_eq!(plan.objects[0].source_worker_id, 10);
-        assert_eq!(plan.objects[1].source_kind, MmSourceKind::ECache);
-        assert_eq!(plan.objects[1].source_worker_id, 21);
-        assert_eq!(plan.objects[2].source_kind, MmSourceKind::ECompute);
-        assert_eq!(plan.objects[2].source_worker_id, 20);
+        assert_eq!(plan.objects[1].source_kind, MmSourceKind::PRemote);
+        assert_eq!(plan.objects[1].source_worker_id, 12);
+        assert_eq!(plan.objects[2].source_kind, MmSourceKind::ECache);
+        assert_eq!(plan.objects[2].source_worker_id, 21);
+        assert_eq!(plan.objects[3].source_kind, MmSourceKind::ECompute);
+        assert_eq!(plan.objects[3].source_worker_id, 20);
     }
 
     #[test]
@@ -911,6 +940,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.objects[0].source_kind, MmSourceKind::PLocal);
+    }
+
+    #[test]
+    fn remote_p_plan_does_not_require_encode_workers() {
+        let cache_keys = vec!["a".to_string()];
+        let plan = MultimodalEpdRouter::build_plan_from_locations(
+            &cache_keys,
+            10,
+            &[],
+            &[vec![11]],
+            &[vec![]],
+            &[false],
+        )
+        .unwrap();
+        assert_eq!(plan.objects[0].source_kind, MmSourceKind::PRemote);
+        assert_eq!(plan.objects[0].source_worker_id, 11);
     }
 
     #[test]

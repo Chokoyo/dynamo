@@ -198,6 +198,73 @@ class TestMultimodalEmbeddingLoader:
         assert pending is not None
 
     @pytest.mark.asyncio
+    async def test_p_remote_dispatch_uses_prefill_embedding_client(self):
+        encode_client = _Client()
+        prefill_client = _Client()
+        plan = _routing_plan(_object_plan(0, 22, source="P_REMOTE"))
+
+        groups, pending = await mod._fetch_embeddings(
+            encode_client,
+            ["http://image/1"],
+            "req-p-remote",
+            _Receiver(),
+            routing_plan=plan,
+            prefill_worker_client=prefill_client,
+        )
+
+        assert prefill_client.direct_calls == [(22, ["http://image/1"])]
+        assert encode_client.direct_calls == []
+        assert groups[0].loaded_embedding.item() == 1.0
+        assert pending is not None
+
+    @pytest.mark.asyncio
+    async def test_p_remote_failure_falls_back_to_encode_routing(self):
+        encode_client = _Client()
+        prefill_client = _FailingDirectClient()
+        plan = _routing_plan(_object_plan(0, 22, source="P_REMOTE"))
+
+        groups, pending = await mod._fetch_embeddings(
+            encode_client,
+            ["http://image/1"],
+            "req-p-remote-fallback",
+            _Receiver(),
+            routing_plan=plan,
+            prefill_worker_client=prefill_client,
+        )
+
+        assert prefill_client.direct_calls == [(22, ["http://image/1"])]
+        assert encode_client.round_robin_calls == 1
+        assert groups[0].loaded_embedding.item() == 1.0
+        assert pending is not None
+
+    @pytest.mark.asyncio
+    async def test_p_remote_failure_only_falls_back_affected_source(self):
+        encode_client = _Client()
+        prefill_client = _FailingDirectClient()
+        plan = _routing_plan(
+            _object_plan(0, 11, source="P_REMOTE"),
+            _object_plan(1, 22, source="P_REMOTE"),
+        )
+
+        groups, pending = await mod._fetch_embeddings(
+            encode_client,
+            ["http://image/1", "http://image/2"],
+            "req-p-remote-partial-fallback",
+            _Receiver(),
+            routing_plan=plan,
+            prefill_worker_client=prefill_client,
+        )
+
+        assert prefill_client.direct_calls == [
+            (11, ["http://image/1"]),
+            (22, ["http://image/2"]),
+        ]
+        assert encode_client.direct_calls == [(11, ["http://image/2"])]
+        assert encode_client.round_robin_calls == 1
+        assert [group.loaded_embedding.item() for group in groups] == [1.0, 2.0]
+        assert pending is not None
+
+    @pytest.mark.asyncio
     async def test_direct_identity_mismatch_retries_without_using_wrong_object(self):
         client = _MismatchedDirectClient()
 
